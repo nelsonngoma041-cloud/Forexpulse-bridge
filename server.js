@@ -8,7 +8,7 @@ const WebSocket = require('ws');
 const PORT = process.env.PORT || 3001;
 const BRIDGE_SECRET = process.env.BRIDGE_SECRET || 'forexpulse2024';
 const DERIV_APP_ID = process.env.DERIV_APP_ID || '342T8yYeveFOVV6CT9yoV';
-const DERIV_WS_URL = wss://ws.derivws.com/websockets/v3?app_id=${DERIV_APP_ID}`;
+const DERIV_WS_URL = `wss://ws.derivws.com/websockets/v3?app_id=${DERIV_APP_ID}`;
 
 const SYMBOL_MAP = {
 EURUSD: 'frxEURUSD', GBPUSD: 'frxGBPUSD', USDJPY: 'frxUSDJPY',
