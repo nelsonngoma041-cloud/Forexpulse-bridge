@@ -9,6 +9,8 @@ const DERIV_WS_URL = 'wss://ws.derivws.com/websockets/v3?app_id=' + DERIV_APP_ID
 const SYMBOL_MAP = {
   EURUSD: 'frxEURUSD', GBPUSD: 'frxGBPUSD', USDJPY: 'frxUSDJPY',
   AUDUSD: 'frxAUDUSD', USDCAD: 'frxUSDCAD',
+  V75: 'R_75', V25: 'R_25', V50: 'R_50', V10: 'R_10',
+  CRASH: 'CRASH500', BOOM: 'BOOM500',
 };
 
 function derivWS(messages) {
@@ -135,10 +137,12 @@ const server = http.createServer(function(req, res) {
       return;
     }
 
-    console.log('[' + new Date().toISOString() + '] Command:', payload.cmd);
+    console.log('[' + new Date().toISOString() + '] Command:', payload.cmd, payload.symbol || '');
 
     if (payload.cmd === 'BUY' || payload.cmd === 'SELL') {
-      derivBuy(token, payload.symbol, payload.cmd, payload.stake || 10, payload.duration || 5)
+      const stake = Number(process.env.DERIV_STAKE || payload.stake || 10);
+      const duration = payload.duration || 5;
+      derivBuy(token, payload.symbol, payload.cmd, stake, duration)
         .then(function(result) {
           res.writeHead(200);
           res.end(JSON.stringify(result));
@@ -158,4 +162,5 @@ const server = http.createServer(function(req, res) {
 server.listen(PORT, function() {
   console.log('ForexPulse Bridge running on port ' + PORT);
   console.log('Deriv App ID: ' + DERIV_APP_ID);
+  console.log('Supported symbols: ' + Object.keys(SYMBOL_MAP).join(', '));
 });
