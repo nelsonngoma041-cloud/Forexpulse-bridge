@@ -289,18 +289,343 @@ function checkContract(contractId) {
   });
 }
 
+
+// ---------- Telegram ----------
+
+const TELEGRAM_TOKEN = cleanEnv(process.env.TELEGRAM_TOKEN);
+const TELEGRAM_CHAT_ID = cleanEnv(process.env.TELEGRAM_CHAT_ID);
+
+const BACKTICK = String.fromCharCode(96);
+const MD_CHARS = '_*[]()~' + BACKTICK + '>#+-=|{}.!\\';
+
+// Escape text for Telegram MarkdownV2
+function md(v) {
+  const s = String(v);
+  let out = '';
+  for (let i = 0; i < s.length; i++) {
+    if (MD_CHARS.indexOf(s[i]) >= 0) out += '\\';
+    out += s[i];
+  }
+  return out;
+}
+
+function sendTelegram(text) {
+  if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) {
+    console.error('Telegram not configured');
+    return Promise.resolve(false);
+  }
+  return fetch('https://api.telegram.org/bot' + TELEGRAM_TOKEN + '/sendMessage', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: text, parse_mode: 'MarkdownV2' }),
+  }).then(function (r) { return r.json(); })
+    .then(function (j) {
+      if (!j.ok) console.error('Telegram error:', j.description);
+      return j.ok === true;
+    })
+    .catch(function (e) { console.error('Telegram failed:', e.message); return false; });
+}
+
+// ---------- Bot ----------
+
+const STAKE = Number(process.env.DERIV_STAKE || 1);
+const MIN_CONFIDENCE = 65;
+const COOLDOWN_MS = 15 * 60 * 1000;
+const MAX_OPEN_TRADES = 3;
+
+const PAIRS = [
+  { symbol: 'EURUSD', display: 'EUR/USD', type: 'forex', decimals: 5 },
+  { symbol: 'GBPUSD', display: 'GBP/USD', type: 'forex', decimals: 5 },
+  { symbol: 'USDJPY', display: 'USD/JPY', type: 'forex', decimals: 3 },
+  { symbol: 'AUDUSD', display: 'AUD/USD', type: 'forex', decimals: 5 },
+  { symbol: 'USDCAD', display: 'USD/CAD', type: 'forex', decimals: 5 },
+  { symbol: 'V75', display: 'Volatility 75', type: 'derived', decimals: 2 },
+  { symbol: 'V25', display: 'Volatility 25', type: 'derived', decimals: 3 },
+  { symbol: 'V50', display: 'Volatility 50', type: 'derived', decimals: 4 },
+  { symbol: 'CRASH', display: 'Crash 500', type: 'derived', decimals: 3 },
+  { symbol: 'BOOM', display: 'Boom 500', type: 'derived', decimals: 3 },
+];
+
+let botRunning = false;
+let autoTrade = process.env.AUTO_TRADE === 'true';
+let signalCount = 0;
+let dailyWins = 0;
+let dailyLosses = 0;
+let scanning = false;
+let loopTimer = null;
+let lastSummaryDate = '';
+const lastSignalAt = {};
+const pendingTrades = [];
+const recentSignals = [];
+
+function lusakaTime() {
+  return new Date().toLocaleTimeString('en-GB', {
+    timeZone: 'Africa/Lusaka', hour: '2-digit', minute: '2-digit', second: '2-digit',
+  });
+}
+
+function lusakaHour() {
+  return parseInt(new Date().toLocaleString('en-GB', {
+    timeZone: 'Africa/Lusaka', hour: 'numeric', hour12: false,
+  }), 10);
+}
+
+function getSession() {
+  const h = lusakaHour();
+  if (h >= 15 && h < 19) return { emoji: '🔥', message: 'Prime window, HIGH liquidity', quality: 3 };
+  if (h >= 10 && h < 15) return { emoji: '✅', message: 'Good liquidity', quality: 2 };
+  if (h >= 19 && h < 22) return { emoji: '⚠️', message: 'Low liquidity, be careful', quality: 1 };
+  return { emoji: '😴', message: 'Very low volume', quality: 0 };
+}
+
+function availablePairs() {
+  const day = new Date().getUTCDay();
+  if (day === 0 || day === 6) return PAIRS.filter(function (p) { return p.type === 'derived'; });
+  return PAIRS;
+}
+
+function analyseSymbol(symbol) {
+  return fetchCandles(SYMBOL_MAP[symbol], 80)
+    .then(function (prices) { return analyze(prices); })
+    .catch(function (e) { console.error('Analyze ' + symbol + ': ' + e.message); return null; });
+}
+
+function checkPendingTrades() {
+  const now = Date.now();
+  const due = pendingTrades.filter(function (t) { return now - t.placedAt >= 15.5 * 60 * 1000; });
+  return due.reduce(function (chain, t) {
+    return chain.then(function () {
+      return checkContract(t.contractId).then(function (r) {
+        if (!r.is_sold && now - t.placedAt < 25 * 60 * 1000) return null;
+        const profit = Number(r.profit || 0);
+        const won = r.status === 'won' || profit > 0;
+        if (won) dailyWins++; else dailyLosses++;
+        pendingTrades.splice(pendingTrades.indexOf(t), 1);
+        return sendTelegram(
+          (won ? '✅ *WIN*' : '❌ *LOSS*') + ' — ' + md(t.display) + ' ' + md(t.action) + '\n' +
+          'Profit: ' + md(profit.toFixed(2)) + '\n' +
+          'Total: ' + md(dailyWins) + 'W/' + md(dailyLosses) + 'L'
+        );
+      }).catch(function (e) { console.error('Check failed: ' + e.message); });
+    });
+  }, Promise.resolve());
+}
+
+function maybeDailySummary() {
+  const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Africa/Lusaka' });
+  if (lusakaHour() === 8 && lastSummaryDate !== today) {
+    lastSummaryDate = today;
+    const total = dailyWins + dailyLosses;
+    const wr = total > 0 ? Math.round(dailyWins / total * 100) : 0;
+    return sendTelegram(
+      '📈 *Daily Summary*\n\n' +
+      'Signals: ' + md(signalCount) + '\n' +
+      'Wins: ' + md(dailyWins) + ' · Losses: ' + md(dailyLosses) + '\n' +
+      'Win rate: ' + md(wr) + '%'
+    ).then(function () { dailyWins = 0; dailyLosses = 0; signalCount = 0; });
+  }
+  return Promise.resolve();
+}
+
+function dispatchSignal() {
+  const session = getSession();
+  if (process.env.SKIP_LOW_SESSION === 'true' && session.quality === 0) return Promise.resolve();
+
+  const pairs = availablePairs().filter(function (p) {
+    return Date.now() - (lastSignalAt[p.symbol] || 0) > COOLDOWN_MS;
+  });
+
+  return Promise.all(pairs.map(function (p) {
+    return analyseSymbol(p.symbol).then(function (a) { return { pair: p, a: a }; });
+  })).then(function (results) {
+    const valid = results.filter(function (r) {
+      return r.a && r.a.action !== 'WAIT' && r.a.confidence >= MIN_CONFIDENCE;
+    }).sort(function (x, y) { return y.a.confidence - x.a.confidence; });
+
+    if (valid.length === 0) { console.log('No clear setup this round'); return null; }
+
+    const pair = valid[0].pair;
+    const a = valid[0].a;
+    const time = lusakaTime();
+    const emoji = a.action === 'BUY' ? '🟢📈' : '🔴📉';
+    const direction = a.action === 'BUY' ? 'Rise' : 'Fall';
+    const price = a.price.toFixed(pair.decimals);
+
+    const record = function () {
+      recentSignals.unshift({
+        id: String(Date.now()), symbol: pair.display, action: a.action,
+        confidence: a.confidence, rsi: a.rsi, time: time.slice(0, 5),
+        type: pair.type, priceSource: 'live',
+      });
+      if (recentSignals.length > 20) recentSignals.pop();
+    };
+
+    // ----- Auto trade -----
+    if (autoTrade) {
+      if (pendingTrades.some(function (t) { return t.display === pair.display; })) return null;
+      if (pendingTrades.length >= MAX_OPEN_TRADES) return null;
+      return placeTrade(pair.symbol, a.action, STAKE).then(function (t) {
+        signalCount++;
+        lastSignalAt[pair.symbol] = Date.now();
+        pendingTrades.push({ contractId: t.contract_id, display: pair.display, action: a.action, placedAt: Date.now() });
+        record();
+        return sendTelegram(
+          emoji + ' *TRADE PLACED — ' + md(pair.display) + '*\n\n' +
+          direction + ' · 15 min · stake $' + md(STAKE) + '\n' +
+          'Price: ' + md(price) + ' · Confidence: ' + md(a.confidence) + '%\n' +
+          'Why: ' + md(a.reason) + '\n' +
+          'Contract: ' + md(t.contract_id) + '\n' +
+          (t.balance_after !== undefined ? 'Balance: ' + md(t.balance_after) + '\n' : '') +
+          '\n🤖 Auto\\-trading \\(' + md(isDemoAccount() ? 'demo' : 'REAL') + '\\) · ⏰ ' + md(time)
+        );
+      }).catch(function (e) {
+        return sendTelegram('⚠️ Auto\\-trade blocked: ' + md(e.message));
+      });
+    }
+
+    // ----- Manual signal -----
+    signalCount++;
+    lastSignalAt[pair.symbol] = Date.now();
+    record();
+    return sendTelegram([
+      emoji + ' *' + md(a.action) + ' — ' + md(pair.display) + '*',
+      pair.type === 'derived' ? '🎲 Derived Index' : '💱 Forex',
+      '',
+      'Price: ' + md(price),
+      'Trade: *' + direction + '* · 15 min',
+      'Confidence: ' + md(a.confidence) + '%',
+      '',
+      'RSI: ' + md(a.rsi.toFixed(1)) + ' · MACD: ' + (a.macd > 0 ? 'Bullish' : 'Bearish'),
+      'Why: ' + md(a.reason),
+      '',
+      '💰 Stake: $' + md(STAKE),
+      '⏳ *Execute within 2–5 mins*',
+      '⚠️ Do NOT execute after 5 mins',
+      '',
+      session.emoji + ' ' + md(session.message),
+      '⏰ ' + md(time) + ' · 🤖 ForexPulse PRO',
+    ].join('\n')).then(function () {
+      setTimeout(function () {
+        if (!botRunning) return;
+        sendTelegram('⏰ *Execute now — ' + md(pair.display) + '*\n' + emoji + ' *' + direction + '* · 15 min\n⚠️ Signal expires in 3 minutes');
+      }, 2 * 60 * 1000);
+    });
+  });
+}
+
+function tick() {
+  if (!botRunning || scanning) return;
+  scanning = true;
+  Promise.resolve()
+    .then(checkPendingTrades)
+    .then(maybeDailySummary)
+    .then(dispatchSignal)
+    .catch(function (e) { console.error('Tick error: ' + e.message); })
+    .then(function () { scanning = false; });
+}
+
+function startBot(announce) {
+  if (botRunning) return false;
+  botRunning = true;
+  if (loopTimer) clearInterval(loopTimer);
+  loopTimer = setInterval(tick, 60000);
+  tick();
+  if (announce) {
+    const s = getSession();
+    sendTelegram(
+      '🤖 *ForexPulse PRO running*\n\n' +
+      '✅ Real Deriv candles, RSI \\+ MACD \\+ MA20\n' +
+      '✅ Runs on the server, not your phone\n' +
+      (autoTrade ? '🤖 Auto\\-trading: *ON*' : '✋ Auto\\-trading: *OFF* \\(manual signals\\)') + '\n\n' +
+      '📱 /status /stop /auto on /auto off /balance\n\n' +
+      s.emoji + ' ' + md(s.message)
+    );
+  }
+  return true;
+}
+
+function stopBot() {
+  if (!botRunning) return false;
+  botRunning = false;
+  if (loopTimer) { clearInterval(loopTimer); loopTimer = null; }
+  return true;
+}
+
+function botStatus() {
+  return {
+    running: botRunning,
+    autoTrade: autoTrade,
+    signalCount: signalCount,
+    dailyWins: dailyWins,
+    dailyLosses: dailyLosses,
+    openTrades: pendingTrades.length,
+    mt5Connected: false,
+    derivConnected: !!(DERIV_API_TOKEN && DERIV_ACCOUNT_ID),
+    recentSignals: recentSignals,
+    message: botRunning
+      ? 'Running — ' + signalCount + ' signals' + (autoTrade ? ' (auto-trading)' : '')
+      : 'Bot stopped',
+  };
+}
+
+function handleTelegramCommand(text) {
+  const parts = String(text).trim().toLowerCase().split(/\s+/);
+  const cmd = parts[0].split('@')[0];
+  const arg = parts[1] || '';
+
+  if (cmd === '/start') {
+    if (botRunning) return sendTelegram('⚠️ Already running\\. Use /status');
+    startBot(true);
+    return Promise.resolve();
+  }
+  if (cmd === '/stop') {
+    stopBot();
+    return sendTelegram('⏸️ Stopped\\. ' + md(signalCount) + ' signals · ' + md(dailyWins) + 'W/' + md(dailyLosses) + 'L');
+  }
+  if (cmd === '/status') {
+    const s = getSession();
+    return sendTelegram(
+      '📊 *Status*\n\n' +
+      'Bot: ' + (botRunning ? '🟢 Running' : '🔴 Stopped') + '\n' +
+      'Auto\\-trading: ' + (autoTrade ? '🤖 ON' : '✋ OFF') + '\n' +
+      'Open trades: ' + md(pendingTrades.length) + '\n' +
+      'Signals: ' + md(signalCount) + '\n' +
+      'Wins: ' + md(dailyWins) + ' · Losses: ' + md(dailyLosses) + '\n' +
+      s.emoji + ' ' + md(s.message) + '\n' +
+      'Time: ' + md(lusakaTime()) + ' CAT'
+    );
+  }
+  if (cmd === '/auto') {
+    if (arg === 'on') { autoTrade = true; return sendTelegram('🤖 Auto\\-trading *ON* \\(' + md(isDemoAccount() ? 'demo' : 'REAL account') + '\\)'); }
+    if (arg === 'off') { autoTrade = false; return sendTelegram('✋ Auto\\-trading *OFF*\\. Manual signals only\\.'); }
+    return sendTelegram('Use /auto on or /auto off');
+  }
+  if (cmd === '/win') { dailyWins++; return sendTelegram('✅ Win recorded: ' + md(dailyWins) + 'W/' + md(dailyLosses) + 'L'); }
+  if (cmd === '/loss') { dailyLosses++; return sendTelegram('❌ Loss recorded: ' + md(dailyWins) + 'W/' + md(dailyLosses) + 'L'); }
+  if (cmd === '/balance') {
+    return derivBalance()
+      .then(function (b) { return sendTelegram('💰 Balance: ' + md(b)); })
+      .catch(function (e) { return sendTelegram('❌ ' + md(e.message)); });
+  }
+  if (cmd === '/accounts') {
+    return listAccounts()
+      .then(function (j) { return sendTelegram('🧾 ' + md(JSON.stringify(j).slice(0, 900))); })
+      .catch(function (e) { return sendTelegram('❌ ' + md(e.message.slice(0, 600))); });
+  }
+  return Promise.resolve();
+}
+
 // ---------- HTTP ----------
 
 function send(res, code, obj) {
-  res.writeHead(code);
+  res.writeHead(code, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify(obj));
 }
 
 const server = http.createServer(function (req, res) {
-  res.setHeader('Content-Type', 'application/json');
-
-  if (req.headers['x-bridge-secret'] !== BRIDGE_SECRET) {
-    send(res, 401, { ok: false, error: 'Unauthorized' });
+  // Keep-alive ping (no secret needed). Point a free pinger here every 10 minutes.
+  if (req.method === 'GET') {
+    send(res, 200, { ok: true, running: botRunning, time: new Date().toISOString() });
     return;
   }
 
@@ -310,6 +635,22 @@ const server = http.createServer(function (req, res) {
     let p;
     try { p = JSON.parse(body); }
     catch (e) { send(res, 400, { ok: false, error: 'Invalid JSON' }); return; }
+
+    // Telegram webhook: only your own chat is allowed
+    if (req.url && req.url.indexOf('/telegram') === 0) {
+      const m = p.message;
+      send(res, 200, { ok: true });
+      if (m && m.text && m.chat && String(m.chat.id) === String(TELEGRAM_CHAT_ID)) {
+        handleTelegramCommand(m.text).catch(function (e) { console.error('Command error: ' + e.message); });
+      }
+      return;
+    }
+
+    // Everything else needs the bridge secret
+    if (req.headers['x-bridge-secret'] !== BRIDGE_SECRET) {
+      send(res, 401, { ok: false, error: 'Unauthorized' });
+      return;
+    }
 
     console.log('[' + new Date().toISOString() + '] ' + p.cmd + ' ' + (p.symbol || ''));
 
@@ -325,37 +666,56 @@ const server = http.createServer(function (req, res) {
     }
 
     if (p.cmd === 'ACCOUNTS') {
-      listAccounts().then(function (j) {
-        send(res, 200, { ok: true, accounts: j });
-      }).catch(function (err) {
-        send(res, 200, { ok: false, error: err.message });
-      });
+      listAccounts().then(function (j) { send(res, 200, { ok: true, accounts: j }); })
+        .catch(function (err) { send(res, 200, { ok: false, error: err.message }); });
       return;
     }
 
     if (p.cmd === 'BALANCE') {
-      derivBalance().then(function (b) {
-        send(res, 200, { ok: true, balance: b });
-      }).catch(function (err) {
-        send(res, 200, { ok: false, error: err.message });
-      });
+      derivBalance().then(function (b) { send(res, 200, { ok: true, balance: b }); })
+        .catch(function (err) { send(res, 200, { ok: false, error: err.message }); });
       return;
     }
 
     if (p.cmd === 'BUY') {
-      placeTrade(p.symbol, p.action, p.stake).then(function (t) {
-        send(res, 200, { ok: true, trade: t });
-      }).catch(function (err) {
-        send(res, 200, { ok: false, error: err.message });
-      });
+      placeTrade(p.symbol, p.action, p.stake).then(function (t) { send(res, 200, { ok: true, trade: t }); })
+        .catch(function (err) { send(res, 200, { ok: false, error: err.message }); });
       return;
     }
 
     if (p.cmd === 'CHECK') {
-      checkContract(p.contract_id).then(function (r) {
-        send(res, 200, { ok: true, result: r });
-      }).catch(function (err) {
-        send(res, 200, { ok: false, error: err.message });
+      checkContract(p.contract_id).then(function (r) { send(res, 200, { ok: true, result: r }); })
+        .catch(function (err) { send(res, 200, { ok: false, error: err.message }); });
+      return;
+    }
+
+    // Dashboard controls
+    if (p.cmd === 'BOT_STATUS') { send(res, 200, Object.assign({ ok: true }, botStatus())); return; }
+    if (p.cmd === 'BOT_START') {
+      const started = startBot(true);
+      send(res, 200, { ok: true, success: started, message: started ? 'Started' : 'Already running' });
+      return;
+    }
+    if (p.cmd === 'BOT_STOP') {
+      const stopped = stopBot();
+      if (stopped) sendTelegram('⏸️ Stopped\\. ' + md(signalCount) + ' signals · ' + md(dailyWins) + 'W/' + md(dailyLosses) + 'L');
+      send(res, 200, { ok: true, success: stopped, signalCount: signalCount, dailyWins: dailyWins, dailyLosses: dailyLosses });
+      return;
+    }
+    if (p.cmd === 'BOT_TEST') {
+      const pair = availablePairs()[0];
+      analyseSymbol(pair.symbol).then(function (a) {
+        if (!a) { send(res, 200, { ok: false, error: 'Deriv feed unreachable' }); return null; }
+        return sendTelegram(
+          '🔔 *Test — ' + md(pair.display) + '*\n\n' +
+          'Action: *' + md(a.action) + '*\n' +
+          'Price: ' + md(a.price.toFixed(pair.decimals)) + '\n' +
+          'RSI: ' + md(a.rsi.toFixed(1)) + '\n' +
+          'Reason: ' + md(a.reason) + '\n\n' +
+          '✅ Live Deriv feed working\\!'
+        ).then(function (ok) {
+          send(res, 200, { ok: true, success: ok, signal: { symbol: pair.display, action: a.action, rsi: a.rsi } });
+        });
       });
       return;
     }
@@ -366,5 +726,9 @@ const server = http.createServer(function (req, res) {
 
 server.listen(PORT, function () {
   console.log('ForexPulse Bridge on port ' + PORT);
-  console.log('App ID set: ' + (DERIV_APP_ID ? 'yes' : 'NO') + ' | Token set: ' + (DERIV_API_TOKEN ? 'yes' : 'NO'));
+  console.log('App ID set: ' + (DERIV_APP_ID ? 'yes' : 'NO') + ' | Token set: ' + (DERIV_API_TOKEN ? 'yes' : 'NO') +
+    ' | Telegram set: ' + (TELEGRAM_TOKEN && TELEGRAM_CHAT_ID ? 'yes' : 'NO') +
+    ' | Auto-trade: ' + autoTrade + ' | Demo account: ' + isDemoAccount());
+  // Restart-proof: Render restarts the server now and then, so resume by itself
+  if (process.env.BOT_AUTOSTART === 'true') startBot(true);
 });
