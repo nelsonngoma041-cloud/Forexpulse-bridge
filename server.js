@@ -160,10 +160,32 @@ function listAccounts() {
       return r.text().then(function (t) {
         let j;
         try { j = JSON.parse(t); } catch (e) { j = { raw: t }; }
-        if (!r.ok) throw new Error('HTTP ' + r.status + ': ' + t.slice(0, 200) + ' [' + credInfo() + ']');
+        if (!r.ok) {
+          return runDiag().then(function (d) {
+            throw new Error('HTTP ' + r.status + ': ' + t.slice(0, 120) + ' [' + credInfo() + '] DIAG: ' + d);
+          });
+        }
         return j;
       });
     });
+}
+
+// Tries several ways to call Deriv and reports only the HTTP status of each
+function runDiag() {
+  function probe(label, url, method, headers) {
+    return fetch(url, { method: method, headers: headers })
+      .then(function (r) { return label + '=' + r.status; })
+      .catch(function (e) { return label + '=ERR'; });
+  }
+  const withApp = { Authorization: 'Bearer ' + DERIV_API_TOKEN, 'Deriv-App-ID': DERIV_APP_ID };
+  const noApp = { Authorization: 'Bearer ' + DERIV_API_TOKEN };
+  const noAuth = { 'Deriv-App-ID': DERIV_APP_ID };
+  return Promise.all([
+    probe('health', 'https://api.derivws.com/v1/health', 'GET', {}),
+    probe('getWithApp', REST_BASE + '/accounts', 'GET', withApp),
+    probe('getNoApp', REST_BASE + '/accounts', 'GET', noApp),
+    probe('getNoToken', REST_BASE + '/accounts', 'GET', noAuth),
+  ]).then(function (a) { return a.join(' '); });
 }
 
 // Get a one-time WebSocket URL for an account
