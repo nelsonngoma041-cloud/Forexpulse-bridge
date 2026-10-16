@@ -253,7 +253,8 @@ function derivBalance() {
 // ---------- Auto trading (demo only unless ALLOW_REAL=true) ----------
 
 const MAX_STAKE = Number(process.env.MAX_STAKE || 5);
-const MAX_TRADES_PER_DAY = Number(process.env.MAX_TRADES_PER_DAY || 20);
+let maxTradesPerDay = Number(process.env.MAX_TRADES_PER_DAY || 20);
+let limitNotifiedDay = '';
 const ALLOW_REAL = process.env.ALLOW_REAL === 'true';
 let durationMin = Number(process.env.DURATION_MIN || 15); // trade length in minutes
 const FALLBACK_DURATIONS = [5, 3, 1];
@@ -277,8 +278,8 @@ function placeTrade(symbol, action, stake) {
 
   const today = new Date().toISOString().slice(0, 10);
   if (today !== tradeDay) { tradeDay = today; tradesToday = 0; }
-  if (tradesToday >= MAX_TRADES_PER_DAY) {
-    return Promise.reject(new Error('Daily trade limit reached (' + MAX_TRADES_PER_DAY + ')'));
+  if (tradesToday >= maxTradesPerDay) {
+    return Promise.reject(new Error('Daily trade limit reached (' + maxTradesPerDay + ')'));
   }
 
   let amount = Number(stake);
@@ -582,6 +583,16 @@ function maybeDailySummary() {
 }
 
 function dispatchSignal() {
+  // Daily limit: say it once, then stay quiet until the next day
+  if (autoTrade) {
+    const day = new Date().toISOString().slice(0, 10);
+    if (day !== tradeDay) { tradeDay = day; tradesToday = 0; }
+    if (tradesToday >= maxTradesPerDay) {
+      if (limitNotifiedDay === day) return Promise.resolve();
+      limitNotifiedDay = day;
+      return sendTelegram('🛑 Daily limit of ' + md(maxTradesPerDay) + ' trades reached\. No more trades until tomorrow \(02:00 Zambia time\)\. Use /limit 40 to raise it\.');
+    }
+  }
   const session = getSession();
   if (process.env.SKIP_LOW_SESSION === 'true' && session.quality === 0) return Promise.resolve();
 
@@ -768,6 +779,13 @@ function handleTelegramCommand(text) {
     if (arg === 'on') { autoTrade = true; return sendTelegram('🤖 Auto\\-trading *ON* \\(' + md(isDemoAccount() ? 'demo' : 'REAL account') + '\\)'); }
     if (arg === 'off') { autoTrade = false; return sendTelegram('✋ Auto\\-trading *OFF*\\. Manual signals only\\.'); }
     return sendTelegram('Use /auto on or /auto off');
+  }
+  if (cmd === '/limit') {
+    const n = parseInt(arg, 10);
+    if (!(n >= 1 && n <= 200)) return sendTelegram('🛑 Daily limit: ' + md(maxTradesPerDay) + ' trades \(' + md(tradesToday) + ' today\)\nUse /limit 40');
+    maxTradesPerDay = n;
+    limitNotifiedDay = '';
+    return sendTelegram('🛑 Daily limit set to *' + md(n) + ' trades*\.');
   }
   if (cmd === '/duration') {
     const m = parseInt(arg, 10);
