@@ -255,6 +255,8 @@ function derivBalance() {
 const MAX_STAKE = Number(process.env.MAX_STAKE || 5);
 const MAX_TRADES_PER_DAY = Number(process.env.MAX_TRADES_PER_DAY || 20);
 const ALLOW_REAL = process.env.ALLOW_REAL === 'true';
+let durationMin = Number(process.env.DURATION_MIN || 15); // trade length in minutes
+const FALLBACK_DURATIONS = [5, 3, 1];
 let tradeDay = '';
 let tradesToday = 0;
 
@@ -283,27 +285,38 @@ function placeTrade(symbol, action, stake) {
   if (!(amount > 0)) amount = 1;
   if (amount > MAX_STAKE) amount = MAX_STAKE;
 
-  return getOtpUrl(DERIV_ACCOUNT_ID).then(function (url) {
-    return wsRequest(url, {
-      buy: '1',
-      price: amount,
-      parameters: {
-        contract_type: action === 'BUY' ? 'CALL' : 'PUT',
-        currency: 'USD',
-        underlying_symbol: derivSym,
-        amount: amount,
-        basis: 'stake',
-        duration: 15,
-        duration_unit: 'm',
-      },
-    }, 25000);
-  }).then(function (msg) {
+  // Try the chosen duration first. If Deriv says it is not offered, try shorter ones.
+  const tries = [durationMin].concat(FALLBACK_DURATIONS.filter(function (d) { return d < durationMin; }));
+  const attempt = function (i) {
+    const mins = tries[i];
+    return getOtpUrl(DERIV_ACCOUNT_ID).then(function (url) {
+      return wsRequest(url, {
+        buy: '1',
+        price: amount,
+        parameters: {
+          contract_type: action === 'BUY' ? 'CALL' : 'PUT',
+          currency: 'USD',
+          underlying_symbol: derivSym,
+          amount: amount,
+          basis: 'stake',
+          duration: mins,
+          duration_unit: 'm',
+        },
+      }, 25000);
+    }).then(function (msg) { msg.usedMinutes = mins; return msg; })
+      .catch(function (e) {
+        if (i + 1 < tries.length && /not offered|duration/i.test(e.message)) return attempt(i + 1);
+        throw e;
+      });
+  };
+  return attempt(0).then(function (msg) {
     tradesToday++;
     const b = msg.buy || {};
     return {
       contract_id: b.contract_id,
       buy_price: b.buy_price,
       longcode: b.longcode,
+      minutes: msg.usedMinutes,
       balance_after: b.balance_after,
       account: DERIV_ACCOUNT_ID,
       tradesToday: tradesToday,
@@ -524,11 +537,11 @@ function learn() {
 
 function checkPendingTrades() {
   const now = Date.now();
-  const due = pendingTrades.filter(function (t) { return now - t.placedAt >= 15.5 * 60 * 1000; });
+  const due = pendingTrades.filter(function (t) { return now - t.placedAt >= ((t.minutes || 15) + 0.5) * 60 * 1000; });
   return due.reduce(function (chain, t) {
     return chain.then(function () {
       return checkContract(t.contractId).then(function (r) {
-        if (!r.is_sold && now - t.placedAt < 25 * 60 * 1000) return null;
+        if (!r.is_sold && now - t.placedAt < ((t.minutes || 15) + 10) * 60 * 1000) return null;
         const profit = Number(r.profit || 0);
         const won = r.status === 'won' || profit > 0;
         if (won) dailyWins++; else dailyLosses++;
@@ -612,7 +625,7 @@ function dispatchSignal() {
         lastSignalAt[pair.symbol] = Date.now();
         pendingTrades.push({
           contractId: t.contract_id, display: pair.display, symbol: pair.symbol,
-          action: a.action, placedAt: Date.now(), votes: a.votes || {},
+          action: a.action, placedAt: Date.now(), votes: a.votes || {}, minutes: t.minutes || durationMin,
         });
         dbInsertTrade({
           contract_id: String(t.contract_id), symbol: pair.symbol, action: a.action,
@@ -622,7 +635,7 @@ function dispatchSignal() {
         record();
         return sendTelegram(
           emoji + ' *TRADE PLACED — ' + md(pair.display) + '*\n\n' +
-          direction + ' · 15 min · stake $' + md(STAKE) + '\n' +
+          direction + ' · ' + md(t.minutes || durationMin) + ' min · stake $' + md(STAKE) + '\n' +
           'Price: ' + md(price) + ' · Confidence: ' + md(a.confidence) + '%\n' +
           'Why: ' + md(a.reason) + '\n' +
           'Contract: ' + md(t.contract_id) + '\n' +
@@ -648,7 +661,7 @@ function dispatchSignal() {
       pair.type === 'derived' ? '🎲 Derived Index' : '💱 Forex',
       '',
       'Price: ' + md(price),
-      'Trade: *' + direction + '* · 15 min',
+      'Trade: *' + direction + '* · ' + durationMin + ' min',
       'Confidence: ' + md(a.confidence) + '%',
       '',
       'RSI: ' + md(a.rsi.toFixed(1)) + ' · MACD: ' + (a.macd > 0 ? 'Bullish' : 'Bearish'),
@@ -663,7 +676,7 @@ function dispatchSignal() {
     ].join('\n')).then(function () {
       setTimeout(function () {
         if (!botRunning) return;
-        sendTelegram('⏰ *Execute now — ' + md(pair.display) + '*\n' + emoji + ' *' + direction + '* · 15 min\n⚠️ Signal expires in 3 minutes');
+        sendTelegram('⏰ *Execute now — ' + md(pair.display) + '*\n' + emoji + ' *' + direction + '* · ' + durationMin + ' min\n⚠️ Signal expires in 3 minutes');
       }, 2 * 60 * 1000);
     });
   });
@@ -755,6 +768,14 @@ function handleTelegramCommand(text) {
     if (arg === 'on') { autoTrade = true; return sendTelegram('🤖 Auto\\-trading *ON* \\(' + md(isDemoAccount() ? 'demo' : 'REAL account') + '\\)'); }
     if (arg === 'off') { autoTrade = false; return sendTelegram('✋ Auto\\-trading *OFF*\\. Manual signals only\\.'); }
     return sendTelegram('Use /auto on or /auto off');
+  }
+  if (cmd === '/duration') {
+    const m = parseInt(arg, 10);
+    if ([1, 2, 3, 5, 10, 15, 30].indexOf(m) === -1) {
+      return sendTelegram('⏱ Trade length: ' + md(durationMin) + ' min\nUse /duration 1, 2, 3, 5, 10, 15 or 30');
+    }
+    durationMin = m;
+    return sendTelegram('⏱ Trade length set to *' + md(m) + ' min*\. Resets to ' + md(process.env.DURATION_MIN || 15) + ' min if Render restarts\.');
   }
   if (cmd === '/learn') {
     return learn().then(function () {
@@ -896,4 +917,3 @@ server.listen(PORT, function () {
     if (process.env.BOT_AUTOSTART === 'true') startBot(true);
   });
 });
-
