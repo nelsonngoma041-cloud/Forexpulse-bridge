@@ -3,9 +3,20 @@ const WebSocket = require('ws');
 
 const PORT = process.env.PORT || 3001;
 const BRIDGE_SECRET = process.env.BRIDGE_SECRET || 'forexpulse2024';
-const DERIV_APP_ID = process.env.DERIV_APP_ID || '';
-const DERIV_API_TOKEN = process.env.DERIV_API_TOKEN || '';
-const DERIV_ACCOUNT_ID = process.env.DERIV_ACCOUNT_ID || '';
+// Strip spaces, quotes, newlines and an accidental "Bearer " prefix
+function cleanEnv(v) {
+  return String(v || '').trim().replace(/^bearer\s+/i, '').replace(/^["']+|["']+$/g, '').trim();
+}
+const DERIV_APP_ID = cleanEnv(process.env.DERIV_APP_ID);
+const DERIV_API_TOKEN = cleanEnv(process.env.DERIV_API_TOKEN);
+const DERIV_ACCOUNT_ID = cleanEnv(process.env.DERIV_ACCOUNT_ID);
+
+// Safe description of the credentials (never the full token)
+function credInfo() {
+  return 'token len ' + DERIV_API_TOKEN.length +
+    ', starts "' + DERIV_API_TOKEN.slice(0, 4) + '", ends "' + DERIV_API_TOKEN.slice(-4) + '"' +
+    ' | appId len ' + DERIV_APP_ID.length + ', starts "' + DERIV_APP_ID.slice(0, 3) + '"';
+}
 
 // New Deriv API
 const REST_BASE = 'https://api.derivws.com/trading/v1/options';
@@ -149,7 +160,7 @@ function listAccounts() {
       return r.text().then(function (t) {
         let j;
         try { j = JSON.parse(t); } catch (e) { j = { raw: t }; }
-        if (!r.ok) throw new Error('HTTP ' + r.status + ': ' + t.slice(0, 300));
+        if (!r.ok) throw new Error('HTTP ' + r.status + ': ' + t.slice(0, 200) + ' [' + credInfo() + ']');
         return j;
       });
     });
