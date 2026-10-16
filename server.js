@@ -213,6 +213,82 @@ function derivBalance() {
   });
 }
 
+// ---------- Auto trading (demo only unless ALLOW_REAL=true) ----------
+
+const MAX_STAKE = Number(process.env.MAX_STAKE || 5);
+const MAX_TRADES_PER_DAY = Number(process.env.MAX_TRADES_PER_DAY || 20);
+const ALLOW_REAL = process.env.ALLOW_REAL === 'true';
+let tradeDay = '';
+let tradesToday = 0;
+
+function isDemoAccount() {
+  // Deriv demo IDs start with DOT or VRT. Real ones start with ROT or CR.
+  return /^(DOT|VRT)/i.test(DERIV_ACCOUNT_ID);
+}
+
+function placeTrade(symbol, action, stake) {
+  if (!DERIV_API_TOKEN) return Promise.reject(new Error('DERIV_API_TOKEN not set'));
+  if (!DERIV_ACCOUNT_ID) return Promise.reject(new Error('DERIV_ACCOUNT_ID not set'));
+  if (!isDemoAccount() && !ALLOW_REAL) {
+    return Promise.reject(new Error('Blocked: account is not demo. Set ALLOW_REAL=true to trade real money'));
+  }
+  const derivSym = SYMBOL_MAP[symbol];
+  if (!derivSym) return Promise.reject(new Error('Unknown symbol ' + symbol));
+  if (action !== 'BUY' && action !== 'SELL') return Promise.reject(new Error('Bad action ' + action));
+
+  const today = new Date().toISOString().slice(0, 10);
+  if (today !== tradeDay) { tradeDay = today; tradesToday = 0; }
+  if (tradesToday >= MAX_TRADES_PER_DAY) {
+    return Promise.reject(new Error('Daily trade limit reached (' + MAX_TRADES_PER_DAY + ')'));
+  }
+
+  let amount = Number(stake);
+  if (!(amount > 0)) amount = 1;
+  if (amount > MAX_STAKE) amount = MAX_STAKE;
+
+  return getOtpUrl(DERIV_ACCOUNT_ID).then(function (url) {
+    return wsRequest(url, {
+      buy: '1',
+      price: amount,
+      parameters: {
+        contract_type: action === 'BUY' ? 'CALL' : 'PUT',
+        currency: 'USD',
+        underlying_symbol: derivSym,
+        amount: amount,
+        basis: 'stake',
+        duration: 15,
+        duration_unit: 'm',
+      },
+    }, 25000);
+  }).then(function (msg) {
+    tradesToday++;
+    const b = msg.buy || {};
+    return {
+      contract_id: b.contract_id,
+      buy_price: b.buy_price,
+      longcode: b.longcode,
+      balance_after: b.balance_after,
+      account: DERIV_ACCOUNT_ID,
+      tradesToday: tradesToday,
+    };
+  });
+}
+
+function checkContract(contractId) {
+  if (!contractId) return Promise.reject(new Error('contract_id missing'));
+  return getOtpUrl(DERIV_ACCOUNT_ID).then(function (url) {
+    return wsRequest(url, { proposal_open_contract: 1, contract_id: Number(contractId) }, 20000);
+  }).then(function (msg) {
+    const c = msg.proposal_open_contract || {};
+    return {
+      is_sold: !!c.is_sold,
+      status: c.status,
+      profit: c.profit,
+      sell_price: c.sell_price,
+    };
+  });
+}
+
 // ---------- HTTP ----------
 
 function send(res, code, obj) {
@@ -260,6 +336,24 @@ const server = http.createServer(function (req, res) {
     if (p.cmd === 'BALANCE') {
       derivBalance().then(function (b) {
         send(res, 200, { ok: true, balance: b });
+      }).catch(function (err) {
+        send(res, 200, { ok: false, error: err.message });
+      });
+      return;
+    }
+
+    if (p.cmd === 'BUY') {
+      placeTrade(p.symbol, p.action, p.stake).then(function (t) {
+        send(res, 200, { ok: true, trade: t });
+      }).catch(function (err) {
+        send(res, 200, { ok: false, error: err.message });
+      });
+      return;
+    }
+
+    if (p.cmd === 'CHECK') {
+      checkContract(p.contract_id).then(function (r) {
+        send(res, 200, { ok: true, result: r });
       }).catch(function (err) {
         send(res, 200, { ok: false, error: err.message });
       });
