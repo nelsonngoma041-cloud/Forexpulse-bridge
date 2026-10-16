@@ -355,6 +355,7 @@ let scanning = false;
 let loopTimer = null;
 let lastSummaryDate = '';
 const lastSignalAt = {};
+const blockedUntil = {};
 const pendingTrades = [];
 const recentSignals = [];
 
@@ -432,7 +433,8 @@ function dispatchSignal() {
   if (process.env.SKIP_LOW_SESSION === 'true' && session.quality === 0) return Promise.resolve();
 
   const pairs = availablePairs().filter(function (p) {
-    return Date.now() - (lastSignalAt[p.symbol] || 0) > COOLDOWN_MS;
+    return Date.now() - (lastSignalAt[p.symbol] || 0) > COOLDOWN_MS &&
+      Date.now() > (blockedUntil[p.symbol] || 0);
   });
 
   return Promise.all(pairs.map(function (p) {
@@ -479,7 +481,12 @@ function dispatchSignal() {
           '\n🤖 Auto\\-trading \\(' + md(isDemoAccount() ? 'demo' : 'REAL') + '\\) · ⏰ ' + md(time)
         );
       }).catch(function (e) {
-        return sendTelegram('⚠️ Auto\\-trade blocked: ' + md(e.message));
+        if (/not offered|duration|closed|not available/i.test(e.message)) {
+          blockedUntil[pair.symbol] = Date.now() + 6 * 60 * 60 * 1000;
+        } else {
+          lastSignalAt[pair.symbol] = Date.now();
+        }
+        return sendTelegram('⚠️ Auto\\-trade blocked on ' + md(pair.display) + ': ' + md(e.message));
       });
     }
 
