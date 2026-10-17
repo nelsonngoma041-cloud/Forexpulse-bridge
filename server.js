@@ -25,6 +25,7 @@ const PUBLIC_WS = 'wss://api.derivws.com/trading/v1/options/ws/public';
 const SYMBOL_MAP = {
   EURUSD: 'frxEURUSD', GBPUSD: 'frxGBPUSD', USDJPY: 'frxUSDJPY',
   AUDUSD: 'frxAUDUSD', USDCAD: 'frxUSDCAD',
+  GOLD: 'frxXAUUSD', SILVER: 'frxXAGUSD',
   V75: 'R_75', V25: 'R_25', V50: 'R_50', V10: 'R_10',
   CRASH: 'CRASH500', BOOM: 'BOOM500',
 };
@@ -79,6 +80,7 @@ function calcMACD(prices) {
 
 const STRATEGIES = ['rsi', 'macd', 'trend', 'bands', 'breakout'];
 const STRAT_NAMES = { rsi: 'RSI', macd: 'MACD', trend: 'Trend', bands: 'Bollinger', breakout: 'Breakout' };
+const MIN_AGREE = Number(process.env.MIN_AGREE || 3); // strategies that must agree
 const weights = { rsi: 1, macd: 1, trend: 1, bands: 1, breakout: 1 };
 
 function calcBands(prices, period, mult) {
@@ -131,8 +133,8 @@ function analyze(prices) {
   let confidence = 0;
   let dir = 0;
   // At least 2 strategies must agree, and agreement must beat disagreement
-  if (nBuy >= 2 && buyW > sellW) { action = 'BUY'; dir = 1; confidence = Math.min(95, Math.round(50 + 50 * (buyW - sellW) / total)); }
-  else if (nSell >= 2 && sellW > buyW) { action = 'SELL'; dir = -1; confidence = Math.min(95, Math.round(50 + 50 * (sellW - buyW) / total)); }
+  if (nBuy >= MIN_AGREE && buyW > sellW) { action = 'BUY'; dir = 1; confidence = Math.min(95, Math.round(50 + 50 * (buyW - sellW) / total)); }
+  else if (nSell >= MIN_AGREE && sellW > buyW) { action = 'SELL'; dir = -1; confidence = Math.min(95, Math.round(50 + 50 * (sellW - buyW) / total)); }
 
   const names = STRATEGIES.filter(function (k) { return dir !== 0 && g.votes[k] === dir; })
     .map(function (k) { return STRAT_NAMES[k]; });
@@ -255,6 +257,13 @@ function derivBalance() {
 const MAX_STAKE = Number(process.env.MAX_STAKE || 5);
 let maxTradesPerDay = Number(process.env.MAX_TRADES_PER_DAY || 20);
 let limitNotifiedDay = '';
+const MAX_CONSEC_LOSSES = Number(process.env.MAX_CONSEC_LOSSES || 4);
+const MAX_DAILY_LOSS = Number(process.env.MAX_DAILY_LOSS || 5); // in dollars
+let consecLosses = 0;
+let dayPnl = 0;
+let pnlDay = '';
+let circuitOpen = false;
+let circuitReason = '';
 const ALLOW_REAL = process.env.ALLOW_REAL === 'true';
 let durationMin = Number(process.env.DURATION_MIN || 15); // trade length in minutes
 const FALLBACK_DURATIONS = [5, 3, 1];
@@ -380,7 +389,7 @@ function sendTelegram(text) {
 // ---------- Bot ----------
 
 const STAKE = Number(process.env.DERIV_STAKE || 1);
-const MIN_CONFIDENCE = 65;
+const MIN_CONFIDENCE = Number(process.env.MIN_CONFIDENCE || 75);
 const COOLDOWN_MS = 15 * 60 * 1000;
 const MAX_OPEN_TRADES = 3;
 
@@ -390,11 +399,11 @@ const PAIRS = [
   { symbol: 'USDJPY', display: 'USD/JPY', type: 'forex', decimals: 3 },
   { symbol: 'AUDUSD', display: 'AUD/USD', type: 'forex', decimals: 5 },
   { symbol: 'USDCAD', display: 'USD/CAD', type: 'forex', decimals: 5 },
+  { symbol: 'GOLD', display: 'Gold/USD', type: 'forex', decimals: 2 },
+  { symbol: 'SILVER', display: 'Silver/USD', type: 'forex', decimals: 3 },
   { symbol: 'V75', display: 'Volatility 75', type: 'derived', decimals: 2 },
   { symbol: 'V25', display: 'Volatility 25', type: 'derived', decimals: 3 },
   { symbol: 'V50', display: 'Volatility 50', type: 'derived', decimals: 4 },
-  { symbol: 'CRASH', display: 'Crash 500', type: 'derived', decimals: 3 },
-  { symbol: 'BOOM', display: 'Boom 500', type: 'derived', decimals: 3 },
 ];
 
 let botRunning = false;
@@ -536,6 +545,25 @@ function learn() {
   }).catch(function (e) { console.error('Learn failed: ' + e.message); });
 }
 
+function recordResult(won, profit) {
+  const day = new Date().toISOString().slice(0, 10);
+  if (day !== pnlDay) { pnlDay = day; dayPnl = 0; consecLosses = 0; circuitOpen = false; circuitReason = ''; }
+  dayPnl += profit;
+  consecLosses = won ? 0 : consecLosses + 1;
+  if (!circuitOpen && consecLosses >= MAX_CONSEC_LOSSES) {
+    circuitOpen = true;
+    circuitReason = consecLosses + ' losses in a row';
+  } else if (!circuitOpen && dayPnl <= -MAX_DAILY_LOSS) {
+    circuitOpen = true;
+    circuitReason = 'lost $' + Math.abs(dayPnl).toFixed(2) + ' today';
+  }
+  if (circuitOpen && !circuitNotified) {
+    circuitNotified = true;
+    sendTelegram('🛑 *Auto\\-trading paused*: ' + md(circuitReason) + '\\.\nNo new trades until tomorrow, or send /resume\\.');
+  }
+}
+let circuitNotified = false;
+
 function checkPendingTrades() {
   const now = Date.now();
   const due = pendingTrades.filter(function (t) { return now - t.placedAt >= ((t.minutes || 15) + 0.5) * 60 * 1000; });
@@ -546,6 +574,7 @@ function checkPendingTrades() {
         const profit = Number(r.profit || 0);
         const won = r.status === 'won' || profit > 0;
         if (won) dailyWins++; else dailyLosses++;
+        recordResult(won, profit);
         pendingTrades.splice(pendingTrades.indexOf(t), 1);
         const closedRow = {
           contract_id: String(t.contractId), symbol: t.symbol, action: t.action,
@@ -583,6 +612,11 @@ function maybeDailySummary() {
 }
 
 function dispatchSignal() {
+  if (autoTrade && circuitOpen) {
+    const d = new Date().toISOString().slice(0, 10);
+    if (d !== pnlDay) { pnlDay = d; dayPnl = 0; consecLosses = 0; circuitOpen = false; circuitNotified = false; }
+    else return Promise.resolve();
+  }
   // Daily limit: say it once, then stay quiet until the next day
   if (autoTrade) {
     const day = new Date().toISOString().slice(0, 10);
@@ -768,6 +802,7 @@ function handleTelegramCommand(text) {
       '📊 *Status*\n\n' +
       'Bot: ' + (botRunning ? '🟢 Running' : '🔴 Stopped') + '\n' +
       'Auto\\-trading: ' + (autoTrade ? '🤖 ON' : '✋ OFF') + '\n' +
+      (circuitOpen ? '🛑 Paused: ' + md(circuitReason) + '\n' : '') +
       'Open trades: ' + md(pendingTrades.length) + '\n' +
       'Signals: ' + md(signalCount) + '\n' +
       'Wins: ' + md(dailyWins) + ' · Losses: ' + md(dailyLosses) + '\n' +
@@ -779,6 +814,10 @@ function handleTelegramCommand(text) {
     if (arg === 'on') { autoTrade = true; return sendTelegram('🤖 Auto\\-trading *ON* \\(' + md(isDemoAccount() ? 'demo' : 'REAL account') + '\\)'); }
     if (arg === 'off') { autoTrade = false; return sendTelegram('✋ Auto\\-trading *OFF*\\. Manual signals only\\.'); }
     return sendTelegram('Use /auto on or /auto off');
+  }
+  if (cmd === '/resume') {
+    circuitOpen = false; circuitNotified = false; consecLosses = 0; dayPnl = 0;
+    return sendTelegram('▶️ Auto\\-trading resumed\\.');
   }
   if (cmd === '/limit') {
     const n = parseInt(arg, 10);
