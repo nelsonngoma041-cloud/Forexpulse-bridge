@@ -782,6 +782,105 @@ function botStatus() {
   };
 }
 
+// ---------- Backtest ----------
+// Replays the strategies on past 1-minute candles and counts wins.
+// Trades never overlap (after a trade, skip until it would have ended).
+
+let backtesting = false;
+const BT_LENGTHS = [5, 15];
+
+function comboVote(votes) {
+  let nBuy = 0, nSell = 0;
+  STRATEGIES.forEach(function (k) {
+    if (votes[k] > 0) nBuy++; else if (votes[k] < 0) nSell++;
+  });
+  const conf = function (d) { return Math.min(95, Math.round(50 + 50 * d / STRATEGIES.length)); };
+  if (nBuy >= MIN_AGREE && nBuy > nSell && conf(nBuy - nSell) >= MIN_CONFIDENCE) return 1;
+  if (nSell >= MIN_AGREE && nSell > nBuy && conf(nSell - nBuy) >= MIN_CONFIDENCE) return -1;
+  return 0;
+}
+
+// data: { SYMBOLKEY: [close, close, ...] }  ->  stats per trade length
+function backtestFromData(data) {
+  const out = {};
+  BT_LENGTHS.forEach(function (N) {
+    const st = { strat: {}, pairs: {} };
+    STRATEGIES.concat(['combo']).forEach(function (k) { st.strat[k] = { n: 0, w: 0 }; });
+    out[N] = st;
+  });
+
+  Object.keys(data).forEach(function (sym) {
+    const prices = data[sym];
+    if (prices.length < 120) return;
+    const votesAt = [];
+    for (let i = 79; i < prices.length; i++) {
+      votesAt[i] = getVotes(prices.slice(i - 79, i + 1)).votes;
+    }
+    BT_LENGTHS.forEach(function (N) {
+      STRATEGIES.concat(['combo']).forEach(function (k) {
+        let i = 79;
+        while (i < prices.length - N) {
+          const v = k === 'combo' ? comboVote(votesAt[i]) : votesAt[i][k];
+          if (v !== 0) {
+            const up = prices[i + N] > prices[i];
+            const down = prices[i + N] < prices[i];
+            const won = (v > 0 && up) || (v < 0 && down);
+            out[N].strat[k].n++;
+            if (won) out[N].strat[k].w++;
+            if (k === 'combo') {
+              const p = out[N].pairs[sym] || (out[N].pairs[sym] = { n: 0, w: 0 });
+              p.n++;
+              if (won) p.w++;
+            }
+            i += N;
+          } else {
+            i++;
+          }
+        }
+      });
+    });
+  });
+  return out;
+}
+
+function btLine(label, s) {
+  if (!s || s.n === 0) return md(label) + ': no trades';
+  const wr = Math.round(s.w / s.n * 100);
+  const mark = s.n < 50 ? ' ⚠️' : (wr >= 55 && s.n >= 100 ? ' ✅' : '');
+  return md(label) + ': ' + md(wr) + '% \\(' + md(s.n) + ' trades\\)' + mark;
+}
+
+function btReport(res, pairCount) {
+  const lines = ['📊 *Backtest*', 'Past 1\\-min candles, ' + md(pairCount) + ' markets\\. Break\\-even is about 53%\\.', '⚠️ = too few trades  ✅ = 55%\\+ with 100\\+ trades', ''];
+  BT_LENGTHS.forEach(function (N) {
+    lines.push('*' + N + ' min trades*');
+    STRATEGIES.forEach(function (k) { lines.push(btLine(STRAT_NAMES[k], res[N].strat[k])); });
+    lines.push(btLine('Combined rule', res[N].strat.combo));
+    const best = Object.keys(res[N].pairs)
+      .filter(function (s) { return res[N].pairs[s].n >= 15; })
+      .sort(function (a, b) { return res[N].pairs[b].w / res[N].pairs[b].n - res[N].pairs[a].w / res[N].pairs[a].n; })
+      .slice(0, 3);
+    if (best.length) lines.push('Best markets: ' + best.map(function (s) { return md(s) + ' ' + md(Math.round(res[N].pairs[s].w / res[N].pairs[s].n * 100)) + '%'; }).join(', '));
+    lines.push('');
+  });
+  return lines.join('\n');
+}
+
+function runBacktest() {
+  const keys = Object.keys(SYMBOL_MAP);
+  const data = {};
+  return keys.reduce(function (chain, key) {
+    return chain.then(function () {
+      return fetchCandles(SYMBOL_MAP[key], 5000).then(function (p) { data[key] = p; })
+        .catch(function (e) { console.error('Backtest fetch ' + key + ': ' + e.message); });
+    });
+  }, Promise.resolve()).then(function () {
+    const got = Object.keys(data).filter(function (k) { return data[k].length >= 120; });
+    if (got.length === 0) throw new Error('No market data could be loaded');
+    return btReport(backtestFromData(data), got.length);
+  });
+}
+
 function handleTelegramCommand(text) {
   const parts = String(text).trim().toLowerCase().split(/\s+/);
   const cmd = parts[0].split('@')[0];
@@ -814,6 +913,19 @@ function handleTelegramCommand(text) {
     if (arg === 'on') { autoTrade = true; return sendTelegram('🤖 Auto\\-trading *ON* \\(' + md(isDemoAccount() ? 'demo' : 'REAL account') + '\\)'); }
     if (arg === 'off') { autoTrade = false; return sendTelegram('✋ Auto\\-trading *OFF*\\. Manual signals only\\.'); }
     return sendTelegram('Use /auto on or /auto off');
+  }
+  if (cmd === '/backtest') {
+    if (backtesting) return sendTelegram('⏳ Backtest is already running\\.');
+    backtesting = true;
+    return sendTelegram('⏳ Backtest started\\. This takes about a minute\\.').then(function () {
+      return runBacktest();
+    }).then(function (txt) {
+      backtesting = false;
+      return sendTelegram(txt);
+    }).catch(function (e) {
+      backtesting = false;
+      return sendTelegram('❌ Backtest failed: ' + md(e.message));
+    });
   }
   if (cmd === '/resume') {
     circuitOpen = false; circuitNotified = false; consecLosses = 0; dayPnl = 0;
