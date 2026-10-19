@@ -171,7 +171,7 @@ function wsRequest(url, message, timeoutMs) {
 }
 
 // Public market data: no login needed
-function fetchCandles(derivSymbol, count) {
+function fetchCandles(derivSymbol, count, timeoutMs) {
   return wsRequest(PUBLIC_WS, {
     ticks_history: derivSymbol,
     adjust_start_time: 1,
@@ -180,7 +180,7 @@ function fetchCandles(derivSymbol, count) {
     start: 1,
     style: 'candles',
     granularity: 60,
-  }).then(function (msg) {
+  }, timeoutMs).then(function (msg) {
     return (msg.candles || []).map(function (c) { return Number(c.close); });
   });
 }
@@ -876,17 +876,34 @@ function btReport(res, pairCount) {
   return lines.join('\n');
 }
 
+function fetchHistory(key, errors) {
+  const sizes = [5000, 2000, 1000];
+  const attempt = function (i) {
+    return fetchCandles(SYMBOL_MAP[key], sizes[i], 45000).then(function (p) {
+      if (p.length < 120) throw new Error('only ' + p.length + ' candles');
+      return p;
+    }).catch(function (e) {
+      errors.push(key + ' (' + sizes[i] + '): ' + e.message);
+      if (i + 1 < sizes.length) return attempt(i + 1);
+      return null;
+    });
+  };
+  return attempt(0);
+}
+
 function runBacktest() {
   const keys = Object.keys(SYMBOL_MAP);
   const data = {};
+  const errors = [];
   return keys.reduce(function (chain, key) {
     return chain.then(function () {
-      return fetchCandles(SYMBOL_MAP[key], 5000).then(function (p) { data[key] = p; })
-        .catch(function (e) { console.error('Backtest fetch ' + key + ': ' + e.message); });
+      return fetchHistory(key, errors).then(function (p) { if (p) data[key] = p; });
     });
   }, Promise.resolve()).then(function () {
-    const got = Object.keys(data).filter(function (k) { return data[k].length >= 120; });
-    if (got.length === 0) throw new Error('No market data could be loaded');
+    const got = Object.keys(data);
+    if (got.length === 0) {
+      throw new Error('No market data could be loaded. ' + (errors[0] || ''));
+    }
     return btReport(backtestFromData(data), got.length);
   });
 }
