@@ -446,7 +446,7 @@ const CAP_KEY = cleanEnv(process.env.CAPITAL_API_KEY);
 const CAP_PASS = cleanEnv(process.env.CAPITAL_API_PASSWORD);
 const CAP_EMAIL = cleanEnv(process.env.CAPITAL_EMAIL);
 const CAP_ON = !!(CAP_KEY && CAP_PASS && CAP_EMAIL);
-let tradeBroker = (process.env.TRADE_BROKER || 'deriv').toLowerCase() === 'capital' ? 'capital' : 'deriv';
+let tradeBroker = (function () { const b = (process.env.TRADE_BROKER || 'deriv').toLowerCase(); return (b === 'capital' || b === 'both') ? b : 'deriv'; })();
 let capRisk = Number(process.env.CAP_RISK || 3);              // dollars risked per trade (the stop loss)
 let capSlAtr = Number(process.env.CAP_SL_ATR || 3);           // stop loss = this many 1-min ATRs
 let capRR = Number(process.env.CAP_RR || 2);                  // take profit = stop loss x this
@@ -716,6 +716,10 @@ function getSession() {
 
 function availablePairs() {
   const day = new Date().getUTCDay();
+  if (tradeBroker === 'both') {
+    if (day === 0 || day === 6) return PAIRS.filter(function (p) { return p.crypto || p.type === 'derived'; });
+    return PAIRS;
+  }
   if (tradeBroker === 'capital') {
     if (day === 0 || day === 6) return PAIRS.filter(function (p) { return p.crypto; });
     return PAIRS.filter(function (p) { return p.type !== 'derived'; });
@@ -725,7 +729,8 @@ function availablePairs() {
 }
 
 function analyseSymbol(symbol) {
-  if (tradeBroker === 'capital') {
+  const pp = PAIRS.filter(function (x) { return x.symbol === symbol; })[0];
+  if (tradeBroker !== 'deriv' && pp && pp.type !== 'derived') {
     return capEpic(symbol).then(capCloses).then(function (prices) { return analyze(prices); })
       .catch(function (e) { console.error('Analyze ' + symbol + ' (Capital): ' + e.message); return null; });
   }
@@ -947,8 +952,8 @@ function dispatchSignal() {
     // ----- Auto trade -----
     if (autoTrade) {
       if (pendingTrades.some(function (t) { return t.display === pair.display; })) return null;
-      if (pendingTrades.length >= MAX_OPEN_TRADES) return null;
-      if (tradeBroker === 'capital' && pair.type !== 'derived') {
+      if (pendingTrades.length >= (tradeBroker === 'both' ? 6 : MAX_OPEN_TRADES)) return null;
+      if (tradeBroker !== 'deriv' && pair.type !== 'derived') {
         return capitalTrade(pair.symbol, a.action).then(function (t) {
           signalCount++;
           tradesToday++;
@@ -1513,12 +1518,12 @@ function handleTelegramCommand(text) {
       .catch(function (e) { return sendTelegram('❌ ' + md(e.message)); });
   }
   if (cmd === '/broker') {
-    if (arg === 'capital' || arg === 'deriv') {
-      if (arg === 'capital' && !CAP_ON) return sendTelegram('❌ Capital\\.com keys are missing in Render\\.');
+    if (arg === 'capital' || arg === 'deriv' || arg === 'both') {
+      if (arg !== 'deriv' && !CAP_ON) return sendTelegram('❌ Capital\\.com keys are missing in Render\\.');
       tradeBroker = arg;
-      return sendTelegram('🔀 Trading broker: *' + md(arg) + '*' + (arg === 'capital' ? md(' (demo, forex and metals only)') : md(' (all markets)')) + '\\. Resets if Render restarts unless TRADE_BROKER is set\\.');
+      return sendTelegram('🔀 Trading broker: *' + md(arg) + '*' + (arg === 'capital' ? md(' (Capital demo: forex, metals, indices, oil, crypto)') : arg === 'both' ? md(' (Capital demo for forex, metals, indices, oil, crypto + Deriv for volatility indices)') : md(' (Deriv, all its markets)')) + '\\. Resets if Render restarts unless TRADE_BROKER is set\\.');
     }
-    return sendTelegram('Broker now: ' + md(tradeBroker) + '\nUse /broker capital or /broker deriv');
+    return sendTelegram('Broker now: ' + md(tradeBroker) + '\nUse /broker capital, /broker deriv or /broker both');
   }
   if (cmd === '/risk') {
     const v = Number(arg);
