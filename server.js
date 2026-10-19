@@ -908,6 +908,219 @@ function runBacktest() {
   });
 }
 
+// ---------- Deep test: months of history + stop loss / take profit ----------
+// /deeptest downloads many pages of 1-min candles, then tests
+//  (a) plain Rise/Fall wins, and (b) trades with a stop loss and take profit.
+// Results in R units: 1R = the amount risked on one trade.
+
+let deepRunning = false;
+const DEEP_PAGES = Number(process.env.DEEP_PAGES || 8);   // 5000 candles per page
+const COST_R = 0.1;        // assumed cost per trade, in R (spread / commission)
+const MAX_HOLD = 60;       // close a trade after 60 candles if no stop or target hit
+const SLTP_CONFIGS = [{ sl: 1, tp: 2, name: '1:2' }, { sl: 1, tp: 3, name: '1:3' }];
+const DEEP_STRATS = STRATEGIES.concat(['combo', 'random']);
+const DEEP_NAMES = { rsi: 'RSI', macd: 'MACD', trend: 'Trend', bands: 'Bollinger', breakout: 'Breakout', combo: 'Combined', random: 'Random' };
+const REAL_KEYS = ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCAD', 'GOLD', 'SILVER'];
+
+function fetchCandlesFull(derivSymbol, count, endEpoch) {
+  return wsRequest(PUBLIC_WS, {
+    ticks_history: derivSymbol,
+    adjust_start_time: 1,
+    count: count,
+    end: endEpoch || 'latest',
+    start: 1,
+    style: 'candles',
+    granularity: 60,
+  }, 45000).then(function (msg) {
+    return (msg.candles || []).map(function (c) {
+      return { t: Number(c.epoch), h: Number(c.high), l: Number(c.low), c: Number(c.close) };
+    });
+  });
+}
+
+// Download several pages, newest first, and join them oldest to newest
+function fetchPaged(key, pages, errors) {
+  let all = [];
+  const step = function (p, end) {
+    if (p >= pages) return Promise.resolve(all);
+    return fetchCandlesFull(SYMBOL_MAP[key], 5000, end).then(function (chunk) {
+      if (!chunk.length) return all;
+      all = chunk.concat(all);
+      return step(p + 1, chunk[0].t - 1);
+    }).catch(function (e) {
+      errors.push(key + ' page ' + (p + 1) + ': ' + e.message);
+      return all;
+    });
+  };
+  return step(0, null);
+}
+
+function atrAt(c, i) {
+  let sum = 0;
+  for (let j = i - 13; j <= i; j++) {
+    const pc = c[j - 1].c;
+    sum += Math.max(c[j].h - c[j].l, Math.abs(c[j].h - pc), Math.abs(c[j].l - pc));
+  }
+  return sum / 14;
+}
+
+// One stop loss / take profit simulation for one strategy on one market
+function simSLTP(c, voteAt, cfg, out) {
+  let i = 79;
+  while (i < c.length - 2) {
+    const v = voteAt(i);
+    if (v === 0) { i++; continue; }
+    const atr = atrAt(c, i);
+    if (!(atr > 0)) { i++; continue; }
+    const entry = c[i].c;
+    const sl = cfg.sl * atr;
+    const tp = cfg.tp * atr;
+    const last = Math.min(i + MAX_HOLD, c.length - 1);
+    let R = null;
+    let j = i + 1;
+    for (; j <= last; j++) {
+      const hitSL = v > 0 ? c[j].l <= entry - sl : c[j].h >= entry + sl;
+      const hitTP = v > 0 ? c[j].h >= entry + tp : c[j].l <= entry - tp;
+      if (hitSL) { R = -1; break; }          // if both hit in one candle, assume the stop came first
+      if (hitTP) { R = cfg.tp / cfg.sl; break; }
+    }
+    if (R === null) {
+      j = last;
+      const move = v > 0 ? c[last].c - entry : entry - c[last].c;
+      R = Math.max(-1, Math.min(cfg.tp / cfg.sl, move / sl));
+    }
+    out.n++;
+    if (R > 0) out.w++;
+    out.sumR += R - COST_R;
+    i = j + 1;
+  }
+}
+
+function emptyAgg() {
+  const a = { rf: {}, sl: {} };
+  ['real', 'synth'].forEach(function (g) {
+    a.rf[g] = {};
+    [5, 15].forEach(function (N) {
+      a.rf[g][N] = {};
+      DEEP_STRATS.forEach(function (k) { a.rf[g][N][k] = { n: 0, w: 0 }; });
+    });
+    a.sl[g] = {};
+    SLTP_CONFIGS.forEach(function (cfg) {
+      a.sl[g][cfg.name] = {};
+      DEEP_STRATS.forEach(function (k) { a.sl[g][cfg.name][k] = { n: 0, w: 0, sumR: 0 }; });
+    });
+  });
+  return a;
+}
+
+// Test one market and add its results to the totals
+function deepProcess(key, c, agg) {
+  const g = REAL_KEYS.indexOf(key) >= 0 ? 'real' : 'synth';
+  const cl = c.map(function (x) { return x.c; });
+  const votesAt = [];
+  for (let i = 79; i < cl.length; i++) votesAt[i] = getVotes(cl.slice(i - 79, i + 1)).votes;
+
+  let seed = 12345 + key.length * 977;
+  const rnd = function () { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+  const voteFor = function (k) {
+    if (k === 'random') return function () { return rnd() < 0.5 ? 1 : -1; };
+    if (k === 'combo') return function (i) { return comboVote(votesAt[i]); };
+    return function (i) { return votesAt[i][k]; };
+  };
+
+  DEEP_STRATS.forEach(function (k) {
+    [5, 15].forEach(function (N) {
+      const vf = voteFor(k);
+      const o = agg.rf[g][N][k];
+      let i = 79;
+      while (i < cl.length - N) {
+        const v = vf(i);
+        if (v === 0) { i++; continue; }
+        const won = (v > 0 && cl[i + N] > cl[i]) || (v < 0 && cl[i + N] < cl[i]);
+        o.n++;
+        if (won) o.w++;
+        i += N;
+      }
+    });
+    SLTP_CONFIGS.forEach(function (cfg) {
+      simSLTP(c, voteFor(k), cfg, agg.sl[g][cfg.name][k]);
+    });
+  });
+}
+
+function pct(o) { return o.n ? Math.round(o.w / o.n * 100) : 0; }
+
+function deepReport(agg, info) {
+  const GL = { real: 'Forex and metals', synth: 'Volatility indices' };
+  const L = [];
+  L.push('📊 *' + md('Deep test') + '*');
+  L.push(md(info.markets + ' markets, about ' + info.days + ' days of 1-min candles.'));
+  L.push(md('Stop-loss tests assume a cost of ' + COST_R + 'R per trade.'));
+  L.push('');
+  L.push('*' + md('Rise/Fall (break-even about 53%)') + '*');
+  ['real', 'synth'].forEach(function (g) {
+    [5, 15].forEach(function (N) {
+      const parts = DEEP_STRATS.map(function (k) {
+        const o = agg.rf[g][N][k];
+        if (!o.n) return DEEP_NAMES[k] + ' none';
+        const mark = o.n < 100 ? ' ⚠️' : (pct(o) >= 55 && o.n >= 300 ? ' ✅' : '');
+        return DEEP_NAMES[k] + ' ' + pct(o) + '% (' + o.n + ')' + mark;
+      });
+      L.push(md(GL[g] + ', ' + N + ' min: ' + parts.join(' | ')));
+    });
+  });
+  L.push('');
+  L.push('*' + md('Stop loss and take profit (average R per trade)') + '*');
+  const found = [];
+  SLTP_CONFIGS.forEach(function (cfg) {
+    ['real', 'synth'].forEach(function (g) {
+      const base = agg.sl[g][cfg.name].random;
+      const baseR = base.n ? base.sumR / base.n : 0;
+      const parts = DEEP_STRATS.map(function (k) {
+        const o = agg.sl[g][cfg.name][k];
+        if (!o.n) return DEEP_NAMES[k] + ' none';
+        const r = o.sumR / o.n;
+        const good = k !== 'random' && o.n >= 300 && r >= 0.1 && r - baseR >= 0.08;
+        if (good) found.push(DEEP_NAMES[k] + ' on ' + GL[g] + ' with ' + cfg.name + ' (' + (r >= 0 ? '+' : '') + r.toFixed(2) + 'R, ' + o.n + ' trades)');
+        return DEEP_NAMES[k] + ' ' + (r >= 0 ? '+' : '') + r.toFixed(2) + 'R ' + pct(o) + '% (' + o.n + ')' + (good ? ' ✅' : (o.n < 100 ? ' ⚠️' : ''));
+      });
+      L.push(md(GL[g] + ', stop ' + cfg.name + ': ' + parts.join(' | ')));
+    });
+  });
+  L.push('');
+  if (found.length) {
+    L.push('*' + md('Possible edge:') + '*');
+    found.slice(0, 4).forEach(function (f) { L.push(md('• ' + f)); });
+    L.push(md('Still treat this as a lead to confirm on demo, not proof.'));
+  } else {
+    L.push('*' + md('Verdict: no strategy clearly beats random entries.') + '*');
+  }
+  return L.join('\n');
+}
+
+function runDeepTest() {
+  const keys = Object.keys(SYMBOL_MAP);
+  const agg = emptyAgg();
+  const errors = [];
+  let markets = 0;
+  let maxSpan = 0;
+  return keys.reduce(function (chain, key) {
+    return chain.then(function () {
+      return fetchPaged(key, DEEP_PAGES, errors).then(function (c) {
+        if (!c || c.length < 500) return null;
+        markets++;
+        maxSpan = Math.max(maxSpan, (c[c.length - 1].t - c[0].t) / 86400);
+        deepProcess(key, c, agg);
+        return new Promise(function (r) { setImmediate(r); });
+      });
+    });
+  }, Promise.resolve()).then(function () {
+    if (markets === 0) throw new Error('No market data could be loaded. ' + (errors[0] || ''));
+    if (errors.length) console.error('Deep test notes: ' + errors.slice(0, 3).join(' | '));
+    return deepReport(agg, { markets: markets, days: Math.round(maxSpan) });
+  });
+}
+
 function handleTelegramCommand(text) {
   const parts = String(text).trim().toLowerCase().split(/\s+/);
   const cmd = parts[0].split('@')[0];
@@ -940,6 +1153,19 @@ function handleTelegramCommand(text) {
     if (arg === 'on') { autoTrade = true; return sendTelegram('🤖 Auto\\-trading *ON* \\(' + md(isDemoAccount() ? 'demo' : 'REAL account') + '\\)'); }
     if (arg === 'off') { autoTrade = false; return sendTelegram('✋ Auto\\-trading *OFF*\\. Manual signals only\\.'); }
     return sendTelegram('Use /auto on or /auto off');
+  }
+  if (cmd === '/deeptest') {
+    if (deepRunning) return sendTelegram('⏳ Deep test is already running\\.');
+    deepRunning = true;
+    return sendTelegram('⏳ Deep test started\\. It takes about 5 to 8 minutes\\. I will message you when done\\.').then(function () {
+      return runDeepTest();
+    }).then(function (txt) {
+      deepRunning = false;
+      return sendTelegram(txt);
+    }).catch(function (e) {
+      deepRunning = false;
+      return sendTelegram('❌ Deep test failed: ' + md(e.message));
+    });
   }
   if (cmd === '/backtest') {
     if (backtesting) return sendTelegram('⏳ Backtest is already running\\.');
