@@ -411,6 +411,13 @@ const PAIRS = [
   { symbol: 'USDCAD', display: 'USD/CAD', type: 'forex', decimals: 5 },
   { symbol: 'GOLD', display: 'Gold/USD', type: 'forex', decimals: 2 },
   { symbol: 'SILVER', display: 'Silver/USD', type: 'forex', decimals: 3 },
+  { symbol: 'US100', display: 'US Tech 100', type: 'cfd', decimals: 1, epic: 'US100', term: 'US Tech 100' },
+  { symbol: 'US500', display: 'US 500', type: 'cfd', decimals: 1, epic: 'US500', term: 'US 500' },
+  { symbol: 'DE40', display: 'Germany 40', type: 'cfd', decimals: 1, epic: 'DE40', term: 'Germany 40' },
+  { symbol: 'J225', display: 'Japan 225', type: 'cfd', decimals: 1, epic: 'J225', term: 'Japan 225' },
+  { symbol: 'OIL', display: 'Crude Oil', type: 'cfd', decimals: 2, epic: 'OIL_CRUDE', term: 'Oil - Crude' },
+  { symbol: 'BTC', display: 'Bitcoin', type: 'cfd', crypto: true, decimals: 0, epic: 'BTCUSD', term: 'Bitcoin' },
+  { symbol: 'ETH', display: 'Ethereum', type: 'cfd', crypto: true, decimals: 1, epic: 'ETHUSD', term: 'Ethereum' },
   { symbol: 'V75', display: 'Volatility 75', type: 'derived', decimals: 2 },
   { symbol: 'V25', display: 'Volatility 25', type: 'derived', decimals: 3 },
   { symbol: 'V50', display: 'Volatility 50', type: 'derived', decimals: 4 },
@@ -444,7 +451,44 @@ let capRisk = Number(process.env.CAP_RISK || 3);              // dollars risked 
 let capSlAtr = Number(process.env.CAP_SL_ATR || 3);           // stop loss = this many 1-min ATRs
 let capRR = Number(process.env.CAP_RR || 2);                  // take profit = stop loss x this
 const CAP_MAX_HOLD_MIN = Number(process.env.CAP_MAX_HOLD_MIN || 120);
-const CAP_EPIC = { EURUSD: 'EURUSD', GBPUSD: 'GBPUSD', USDJPY: 'USDJPY', AUDUSD: 'AUDUSD', USDCAD: 'USDCAD', GOLD: 'GOLD', SILVER: 'SILVER' };
+const CAP_RESOLVED = {};   // symbol -> real Capital.com epic
+let capNext = 0;
+function capThrottle() {   // stay under the 10 requests per second limit
+  const now = Date.now();
+  const at = Math.max(now, capNext);
+  capNext = at + 150;
+  return new Promise(function (r) { setTimeout(r, at - now); });
+}
+
+// Find the real market name (epic) on Capital.com, by guess first, then by search
+function capEpic(symbol) {
+  const p = PAIRS.filter(function (x) { return x.symbol === symbol; })[0];
+  if (!p) return Promise.reject(new Error('Not offered on Capital.com: ' + symbol));
+  if (CAP_RESOLVED[symbol]) return Promise.resolve(CAP_RESOLVED[symbol]);
+  const guess = p.epic || p.symbol;
+  return capCall('GET', '/markets/' + encodeURIComponent(guess)).then(function () {
+    CAP_RESOLVED[symbol] = guess;
+    return guess;
+  }).catch(function (e) {
+    if (e.status !== 404 && e.status !== 400) throw e;
+    return capCall('GET', '/markets?searchTerm=' + encodeURIComponent(p.term || p.display)).then(function (j) {
+      const m = (j.markets || [])[0];
+      if (!m || !m.epic) {
+        blockedUntil[symbol] = Date.now() + 6 * 60 * 60 * 1000;
+        throw new Error('Not offered on Capital.com: ' + symbol);
+      }
+      CAP_RESOLVED[symbol] = m.epic;
+      return m.epic;
+    });
+  });
+}
+
+// Recent 1-minute closes from Capital.com, for the signal analysis
+function capCloses(epic) {
+  return capCall('GET', '/prices/' + epic + '?resolution=MINUTE&max=100').then(function (j) {
+    return (j.prices || []).map(function (x) { return (Number(x.closePrice.bid) + Number(x.closePrice.ask)) / 2; });
+  });
+}
 
 let capTokens = null;      // { cst, sec, at }
 let capLastLogin = 0;
@@ -482,7 +526,7 @@ function capEnsure() {
 
 // method, path like '/positions', optional JSON body
 function capCall(method, path, body, retried) {
-  return capEnsure().then(function () {
+  return capEnsure().then(function () { return capThrottle(); }).then(function () {
     const opt = {
       method: method,
       headers: { 'X-SECURITY-TOKEN': capTokens.sec, CST: capTokens.cst, 'Content-Type': 'application/json' },
@@ -529,8 +573,10 @@ function capAtr(epic) {
 
 // Open a demo position with stop loss and take profit
 function capitalTrade(symbol, action) {
-  const epic = CAP_EPIC[symbol];
-  if (!epic) return Promise.reject(new Error('Not offered on Capital.com: ' + symbol));
+  return capEpic(symbol).then(function (epic) { return capitalTradeEpic(epic, action); });
+}
+
+function capitalTradeEpic(epic, action) {
   return Promise.all([capCall('GET', '/markets/' + epic), capAtr(epic)]).then(function (res) {
     const m = res[0];
     const atr = res[1];
@@ -552,6 +598,7 @@ function capitalTrade(symbol, action) {
     let size = capRisk / sl;
     size = Math.floor(size / step) * step;
     size = Math.max(minSize, Math.min(maxSize, Number(size.toFixed(6))));
+    if (size * sl > capRisk * 2.5) throw new Error('Too big for your risk setting: ' + epic + ' (smallest trade would risk $' + (size * sl).toFixed(2) + ')');
     const body = {
       epic: epic, direction: action === 'BUY' ? 'BUY' : 'SELL', size: size,
       stopDistance: Number(sl.toPrecision(6)), profitDistance: Number(tp.toPrecision(6)),
@@ -670,14 +717,18 @@ function getSession() {
 function availablePairs() {
   const day = new Date().getUTCDay();
   if (tradeBroker === 'capital') {
-    if (day === 0 || day === 6) return [];
-    return PAIRS.filter(function (p) { return p.type === 'forex'; });
+    if (day === 0 || day === 6) return PAIRS.filter(function (p) { return p.crypto; });
+    return PAIRS.filter(function (p) { return p.type !== 'derived'; });
   }
   if (day === 0 || day === 6) return PAIRS.filter(function (p) { return p.type === 'derived'; });
-  return PAIRS;
+  return PAIRS.filter(function (p) { return p.type !== 'cfd'; });
 }
 
 function analyseSymbol(symbol) {
+  if (tradeBroker === 'capital') {
+    return capEpic(symbol).then(capCloses).then(function (prices) { return analyze(prices); })
+      .catch(function (e) { console.error('Analyze ' + symbol + ' (Capital): ' + e.message); return null; });
+  }
   return fetchCandles(SYMBOL_MAP[symbol], 80)
     .then(function (prices) { return analyze(prices); })
     .catch(function (e) { console.error('Analyze ' + symbol + ': ' + e.message); return null; });
@@ -897,7 +948,7 @@ function dispatchSignal() {
     if (autoTrade) {
       if (pendingTrades.some(function (t) { return t.display === pair.display; })) return null;
       if (pendingTrades.length >= MAX_OPEN_TRADES) return null;
-      if (tradeBroker === 'capital' && pair.type === 'forex') {
+      if (tradeBroker === 'capital' && pair.type !== 'derived') {
         return capitalTrade(pair.symbol, a.action).then(function (t) {
           signalCount++;
           tradesToday++;
@@ -921,11 +972,12 @@ function dispatchSignal() {
             '\n🤖 Auto\\-trading · ⏰ ' + md(time)
           );
         }).catch(function (e) {
-          if (/closed|not offered|not tradeable|not available/i.test(e.message)) {
+          if (/closed|not offered|not tradeable|not available|too big/i.test(e.message)) {
             blockedUntil[pair.symbol] = Date.now() + 60 * 60 * 1000;
-          } else {
-            lastSignalAt[pair.symbol] = Date.now();
+            console.log('Capital skip ' + pair.symbol + ': ' + e.message);
+            return null;
           }
+          lastSignalAt[pair.symbol] = Date.now();
           return sendTelegram('⚠️ Capital trade blocked on ' + md(pair.display) + ': ' + md(e.message));
         });
       }
@@ -1582,7 +1634,7 @@ const server = http.createServer(function (req, res) {
       return;
     }
     if (p.cmd === 'BOT_TEST') {
-      const pair = availablePairs()[0];
+      const pair = availablePairs()[0] || PAIRS[0];
       analyseSymbol(pair.symbol).then(function (a) {
         if (!a) { send(res, 200, { ok: false, error: 'Deriv feed unreachable' }); return null; }
         return sendTelegram(
