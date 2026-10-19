@@ -380,7 +380,17 @@ function sendTelegram(text) {
     body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: text, parse_mode: 'MarkdownV2' }),
   }).then(function (r) { return r.json(); })
     .then(function (j) {
-      if (!j.ok) console.error('Telegram error:', j.description);
+      if (!j.ok) {
+        console.error('Telegram error:', j.description);
+        if (/parse entities/i.test(String(j.description))) {
+          const plain = String(text).replace(/\\(.)/g, '$1').replace(/\*/g, '');
+          return fetch('https://api.telegram.org/bot' + TELEGRAM_TOKEN + '/sendMessage', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: plain }),
+          }).then(function (r2) { return r2.json(); }).then(function (j2) { return j2.ok === true; });
+        }
+      }
       return j.ok === true;
     })
     .catch(function (e) { console.error('Telegram failed:', e.message); return false; });
@@ -851,7 +861,7 @@ function btLine(label, s) {
 }
 
 function btReport(res, pairCount) {
-  const lines = ['📊 *Backtest*', 'Past 1\\-min candles, ' + md(pairCount) + ' markets\\. Break\\-even is about 53%\\.', '⚠️ = too few trades  ✅ = 55%\\+ with 100\\+ trades', ''];
+  const lines = ['📊 *Backtest*', 'Past 1\\-min candles, ' + md(pairCount) + ' markets\\. Break\\-even is about 53%\\.', '⚠️ \\= too few trades  ✅ \\= 55%\\+ with 100\\+ trades', ''];
   BT_LENGTHS.forEach(function (N) {
     lines.push('*' + N + ' min trades*');
     STRATEGIES.forEach(function (k) { lines.push(btLine(STRAT_NAMES[k], res[N].strat[k])); });
