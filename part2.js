@@ -550,8 +550,9 @@ function dispatchSignalInner() {
 
     if (valid.length === 0) { console.log('No clear setup this round'); return null; }
 
-    const pair = valid[0].pair;
-    const a = valid[0].a;
+    const place = function (pick) {
+    const pair = pick.pair;
+    const a = pick.a;
     const time = lusakaTime();
     const emoji = a.action === 'BUY' ? '🟢📈' : '🔴📉';
     const direction = a.action === 'BUY' ? 'Rise' : 'Fall';
