@@ -25,6 +25,14 @@
         sendTelegram('⏰ *Execute now — ' + md(pair.display) + '*\n' + emoji + ' *' + direction + '* · ' + durationMin + ' min\n⚠️ Signal expires in 3 minutes');
       }, 2 * 60 * 1000);
     });
+    };
+    // Both brokers: one Capital.com trade and one Deriv trade per round, so neither starves the other
+    if (tradeBroker === 'both' && autoTrade) {
+      const capPick = valid.filter(function (r) { return r.pair.type !== 'derived'; })[0];
+      const derPick = valid.filter(function (r) { return r.pair.type === 'derived'; })[0];
+      return Promise.resolve(capPick ? place(capPick) : null).then(function () { return derPick ? place(derPick) : null; });
+    }
+    return place(valid[0]);
   });
 }
 
