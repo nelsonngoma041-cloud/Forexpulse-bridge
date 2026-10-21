@@ -1,3 +1,162 @@
+    // ----- Manual signal -----
+    signalCount++;
+    lastSignalAt[pair.symbol] = Date.now();
+    record();
+    return sendTelegram([
+      emoji + ' *' + md(a.action) + ' — ' + md(pair.display) + '*',
+      pair.type === 'derived' ? '🎲 Derived Index' : '💱 Forex',
+      '',
+      'Price: ' + md(price),
+      'Trade: *' + direction + '* · ' + durationMin + ' min',
+      'Confidence: ' + md(a.confidence) + '%',
+      '',
+      'RSI: ' + md(a.rsi.toFixed(1)) + ' · MACD: ' + (a.macd > 0 ? 'Bullish' : 'Bearish'),
+      'Why: ' + md(a.reason),
+      '',
+      '💰 Stake: $' + md(STAKE),
+      '⏳ *Execute within 2–5 mins*',
+      '⚠️ Do NOT execute after 5 mins',
+      '',
+      session.emoji + ' ' + md(session.message),
+      '⏰ ' + md(time) + ' · 🤖 ForexPulse PRO',
+    ].join('\n')).then(function () {
+      setTimeout(function () {
+        if (!botRunning) return;
+        sendTelegram('⏰ *Execute now — ' + md(pair.display) + '*\n' + emoji + ' *' + direction + '* · ' + durationMin + ' min\n⚠️ Signal expires in 3 minutes');
+      }, 2 * 60 * 1000);
+    });
+    };
+    // Both brokers: one Capital.com trade and one Deriv trade per round, so neither starves the other
+    if (tradeBroker === 'both' && autoTrade) {
+      const capPick = valid.filter(function (r) { return r.pair.type !== 'derived'; })[0];
+      const derPick = valid.filter(function (r) { return r.pair.type === 'derived'; })[0];
+      return Promise.resolve(capPick ? place(capPick) : null).then(function () { return derPick ? place(derPick) : null; });
+    }
+    return place(valid[0]);
+  });
+}
+
+function tick() {
+  if (!botRunning || scanning) return;
+  scanning = true;
+  Promise.resolve()
+    .then(checkPendingTrades)
+    .then(checkCapitalTrades)
+    .then(maybeDailySummary)
+    .then(dispatchSignal)
+    .then(function () { return ensureNews().then(maybeNewsTrade); })
+    .then(maybeEvolvedTrade)
+    .then(maybeSmcTrade)
+    .then(mirrorSync)
+    .catch(function (e) { console.error('Tick error: ' + e.message); })
+    .then(function () { scanning = false; });
+}
+
+function startBot(announce) {
+  if (botRunning) return false;
+  botRunning = true;
+  if (loopTimer) clearInterval(loopTimer);
+  loopTimer = setInterval(tick, 60000);
+  tick();
+  if (announce) {
+    const s = getSession();
+    sendTelegram(
+      '🤖 *ForexPulse PRO running*\n\n' +
+      '✅ Real Deriv candles, RSI \\+ MACD \\+ MA20\n' +
+      '✅ Runs on the server, not your phone\n' +
+      (autoTrade ? '🤖 Auto\\-trading: *ON*' : '✋ Auto\\-trading: *OFF* \\(manual signals\\)') + '\n\n' +
+      '📱 /status /stop /auto on /auto off /balance\n\n' +
+      s.emoji + ' ' + md(s.message)
+    );
+  }
+  return true;
+}
+
+function stopBot() {
+  if (!botRunning) return false;
+  botRunning = false;
+  if (loopTimer) { clearInterval(loopTimer); loopTimer = null; }
+  return true;
+}
+
+function botStatus() {
+  return {
+    running: botRunning,
+    autoTrade: autoTrade,
+    signalCount: signalCount,
+    dailyWins: dailyWins,
+    dailyLosses: dailyLosses,
+    openTrades: pendingTrades.length,
+    mt5Connected: false,
+    derivConnected: !!(DERIV_API_TOKEN && DERIV_ACCOUNT_ID),
+    recentSignals: recentSignals,
+    message: botRunning
+      ? 'Running — ' + signalCount + ' signals' + (autoTrade ? ' (auto-trading)' : '')
+      : 'Bot stopped',
+  };
+}
+
+// ---------- Backtest ----------
+// Replays the strategies on past 1-minute candles and counts wins.
+// Trades never overlap (after a trade, skip until it would have ended).
+
+let backtesting = false;
+const BT_LENGTHS = [5, 15];
+
+function comboVote(votes) {
+  let nBuy = 0, nSell = 0;
+  STRATEGIES.forEach(function (k) {
+    if (votes[k] > 0) nBuy++; else if (votes[k] < 0) nSell++;
+  });
+  const conf = function (d) { return Math.min(95, Math.round(50 + 50 * d / STRATEGIES.length)); };
+  if (nBuy >= MIN_AGREE && nBuy > nSell && conf(nBuy - nSell) >= MIN_CONFIDENCE) return 1;
+  if (nSell >= MIN_AGREE && nSell > nBuy && conf(nSell - nBuy) >= MIN_CONFIDENCE) return -1;
+  return 0;
+}
+
+// data: { SYMBOLKEY: [close, close, ...] }  ->  stats per trade length
+function backtestFromData(data) {
+  const out = {};
+  BT_LENGTHS.forEach(function (N) {
+    const st = { strat: {}, pairs: {} };
+    STRATEGIES.concat(['combo']).forEach(function (k) { st.strat[k] = { n: 0, w: 0 }; });
+    out[N] = st;
+  });
+
+  Object.keys(data).forEach(function (sym) {
+    const prices = data[sym];
+    if (prices.length < 120) return;
+    const votesAt = [];
+    for (let i = 79; i < prices.length; i++) {
+      votesAt[i] = getVotes(prices.slice(i - 79, i + 1)).votes;
+    }
+    BT_LENGTHS.forEach(function (N) {
+      STRATEGIES.concat(['combo']).forEach(function (k) {
+        let i = 79;
+        while (i < prices.length - N) {
+          const v = k === 'combo' ? comboVote(votesAt[i]) : votesAt[i][k];
+          if (v !== 0) {
+            const up = prices[i + N] > prices[i];
+            const down = prices[i + N] < prices[i];
+            const won = (v > 0 && up) || (v < 0 && down);
+            out[N].strat[k].n++;
+            if (won) out[N].strat[k].w++;
+            if (k === 'combo') {
+              const p = out[N].pairs[sym] || (out[N].pairs[sym] = { n: 0, w: 0 });
+              p.n++;
+              if (won) p.w++;
+            }
+            i += N;
+          } else {
+            i++;
+          }
+        }
+      });
+    });
+  });
+  return out;
+}
+
 function btLine(label, s) {
   if (!s || s.n === 0) return md(label) + ': no trades';
   const wr = Math.round(s.w / s.n * 100);
@@ -264,192 +423,5 @@ function runDeepTest() {
     if (errors.length) console.error('Deep test notes: ' + errors.slice(0, 3).join(' | '));
     return deepReport(agg, { markets: markets, days: Math.round(maxSpan) });
   });
-}
-
-// ---------- Strategy research (/strategytest) ----------
-// Tests 15 strategy modules one at a time, plus a random-entry control, on hourly
-// Capital.com candles. Same data, costs and rules for every module.
-//  - Signal is read at the close of a bar; the trade enters at the NEXT bar open (no look-ahead).
-//  - One trade at a time per module and market (no duplicate or overlapping signals).
-//  - Stop loss = ATR x multiple, take profit = stop x RR, forced exit after 48 bars.
-//  - If stop and target are both inside one bar, the stop is assumed to hit first.
-//  - Cost per trade = the real bid/ask spread at entry, plus an assumed slippage (STRAT_SLIP).
-//  - Swap is NOT known; set STRAT_SWAP_R (R per night) if you want to model it.
-//  - Periods are chronological: first 50% train, next 25% validation, last 25% out-of-sample.
-// Nothing is optimised on the data: parameters are fixed in advance. Sensitivity runs only
-// show how results change if the stop and target are changed.
-
-let stratRunning = false;
-const STRAT_PAGES = Number(process.env.STRAT_PAGES || 8);        // 1000 hourly bars per page
-const STRAT_SLIP = Number(process.env.STRAT_SLIP || 0.5);        // extra slippage as a share of the spread
-const STRAT_SWAP_R = Number(process.env.STRAT_SWAP_R || 0);      // swap cost in R per night held
-const ST_WARM = 210;
-const ST_MAXHOLD = 48;
-const ST_MARKETS = ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCAD', 'GOLD'];
-const ST_VARIANTS = [
-  { sl: 1.5, rr: 2, name: 'SL1.5 RR2' },   // the default, listed first
-  { sl: 1.0, rr: 2, name: 'SL1.0 RR2' },
-  { sl: 2.0, rr: 2, name: 'SL2.0 RR2' },
-  { sl: 1.5, rr: 1.5, name: 'SL1.5 RR1.5' },
-  { sl: 1.5, rr: 3, name: 'SL1.5 RR3' },
-];
-const ST_STRATS = [
-  ['ema', 'EMA trend'], ['mtf', 'Multi-timeframe trend'], ['pull', 'Trend pullback'],
-  ['adx', 'ADX trend'], ['donch', 'Donchian breakout'], ['srb', 'S/R breakout'],
-  ['retest', 'Breakout retest'], ['asian', 'Asian range breakout'], ['bbmr', 'Bollinger reversion'],
-  ['rsimr', 'RSI reversion'], ['macd', 'MACD momentum'], ['candle', 'Candle reversal'],
-  ['pday', 'Prev-day breakout'], ['atrb', 'ATR breakout'], ['ichi', 'Ichimoku trend'],
-  ['rand', 'RANDOM (control)'],
-];
-
-function stIso(ms) { return new Date(ms).toISOString().slice(0, 19); }
-
-// Hourly candles from Capital.com, newest pages first, joined oldest to newest
-function stFetchHistory(symbol, pages, errors) {
-  return capEpic(symbol).then(function (epic) {
-    let all = [];
-    const step = function (p, to) {
-      if (p >= pages) return Promise.resolve(all);
-      return capCall('GET', '/prices/' + epic + '?resolution=HOUR&max=1000' + (to ? '&to=' + to : '')).then(function (j) {
-        const arr = (j.prices || []).map(function (x) {
-          const m = function (o) { return (Number(o.bid) + Number(o.ask)) / 2; };
-          return {
-            t: Date.parse((x.snapshotTimeUTC || x.snapshotTime) + 'Z'),
-            o: m(x.openPrice), h: m(x.highPrice), l: m(x.lowPrice), c: m(x.closePrice),
-            sp: Math.abs(Number(x.openPrice.ask) - Number(x.openPrice.bid)),
-          };
-        }).filter(function (b) { return !isNaN(b.t) && b.h > 0; });
-        if (!arr.length) return all;
-        arr.sort(function (a, b) { return a.t - b.t; });
-        all = arr.concat(all);
-        return step(p + 1, stIso(arr[0].t - 1000));
-      }).catch(function (e) {
-        errors.push(symbol + ' page ' + (p + 1) + ': ' + e.message);
-        return all;
-      });
-    };
-    return step(0, null);
-  }).then(function (all) {
-    const seen = {};
-    return all.filter(function (b) { if (seen[b.t]) return false; seen[b.t] = true; return true; })
-      .sort(function (a, b) { return a.t - b.t; });
-  });
-}
-
-// ----- indicators over arrays -----
-function stEma(a, p) {
-  const out = new Array(a.length);
-  const k = 2 / (p + 1);
-  out[0] = a[0];
-  for (let i = 1; i < a.length; i++) out[i] = a[i] * k + out[i - 1] * (1 - k);
-  return out;
-}
-function stWilder(a, p, start) {
-  const out = new Array(a.length).fill(NaN);
-  let sum = 0;
-  for (let i = start; i < start + p; i++) sum += a[i];
-  out[start + p - 1] = sum / p;
-  for (let i = start + p; i < a.length; i++) out[i] = (out[i - 1] * (p - 1) + a[i]) / p;
-  return out;
-}
-function stBuild(bars) {
-  const n = bars.length;
-  const o = bars.map(function (b) { return b.o; }), h = bars.map(function (b) { return b.h; });
-  const l = bars.map(function (b) { return b.l; }), c = bars.map(function (b) { return b.c; });
-  const D = { n: n, bars: bars, o: o, h: h, l: l, c: c, sp: bars.map(function (b) { return b.sp; }) };
-  const tr = [0], pdm = [0], mdm = [0];
-  for (let i = 1; i < n; i++) {
-    tr.push(Math.max(h[i] - l[i], Math.abs(h[i] - c[i - 1]), Math.abs(l[i] - c[i - 1])));
-    const up = h[i] - h[i - 1], dn = l[i - 1] - l[i];
-    pdm.push(up > dn && up > 0 ? up : 0);
-    mdm.push(dn > up && dn > 0 ? dn : 0);
-  }
-  D.atr = stWilder(tr, 14, 1);
-  const str = stWilder(tr, 14, 1), sp = stWilder(pdm, 14, 1), sm = stWilder(mdm, 14, 1);
-  D.pdi = new Array(n).fill(NaN); D.mdi = new Array(n).fill(NaN);
-  const dx = new Array(n).fill(0);
-  for (let i = 0; i < n; i++) {
-    if (str[i] > 0) {
-      D.pdi[i] = 100 * sp[i] / str[i]; D.mdi[i] = 100 * sm[i] / str[i];
-      const sum = D.pdi[i] + D.mdi[i];
-      dx[i] = sum > 0 ? 100 * Math.abs(D.pdi[i] - D.mdi[i]) / sum : 0;
-    }
-  }
-  D.adx = stWilder(dx, 14, 14);
-  D.ema20 = stEma(c, 20); D.ema50 = stEma(c, 50); D.ema200 = stEma(c, 200);
-  // RSI (Wilder)
-  const gain = [0], loss = [0];
-  for (let i = 1; i < n; i++) { const d = c[i] - c[i - 1]; gain.push(d > 0 ? d : 0); loss.push(d < 0 ? -d : 0); }
-  const ag = stWilder(gain, 14, 1), al = stWilder(loss, 14, 1);
-  D.rsi = ag.map(function (g, i) { return al[i] === 0 ? 100 : 100 - 100 / (1 + g / al[i]); });
-  // MACD histogram
-  const e12 = stEma(c, 12), e26 = stEma(c, 26);
-  const macdLine = e12.map(function (v, i) { return v - e26[i]; });
-  const sig9 = stEma(macdLine, 9);
-  D.hist = macdLine.map(function (v, i) { return v - sig9[i]; });
-  // Bollinger (20, 2)
-  D.bbU = new Array(n).fill(NaN); D.bbL = new Array(n).fill(NaN);
-  for (let i = 19; i < n; i++) {
-    let s = 0;
-    for (let k = i - 19; k <= i; k++) s += c[k];
-    const mean = s / 20;
-    let v = 0;
-    for (let k = i - 19; k <= i; k++) v += (c[k] - mean) * (c[k] - mean);
-    const sd = Math.sqrt(v / 20);
-    D.bbU[i] = mean + 2 * sd; D.bbL[i] = mean - 2 * sd;
-  }
-  // Donchian 20 of the PRIOR bars, and the 10 prior bars' extremes
-  D.dHi = new Array(n).fill(NaN); D.dLo = new Array(n).fill(NaN);
-  D.p10Hi = new Array(n).fill(NaN); D.p10Lo = new Array(n).fill(NaN);
-  for (let i = 20; i < n; i++) {
-    let hi = -Infinity, lo = Infinity;
-    for (let k = i - 20; k < i; k++) { if (h[k] > hi) hi = h[k]; if (l[k] < lo) lo = l[k]; }
-    D.dHi[i] = hi; D.dLo[i] = lo;
-    let hi2 = -Infinity, lo2 = Infinity;
-    for (let k = i - 10; k < i; k++) { if (h[k] > hi2) hi2 = h[k]; if (l[k] < lo2) lo2 = l[k]; }
-    D.p10Hi[i] = hi2; D.p10Lo[i] = lo2;
-  }
-  // Ichimoku (cloud shifted 26 bars forward, so no look-ahead)
-  const hl = function (i, p) {
-    let hi = -Infinity, lo = Infinity;
-    for (let k = i - p + 1; k <= i; k++) { if (h[k] > hi) hi = h[k]; if (l[k] < lo) lo = l[k]; }
-    return (hi + lo) / 2;
-  };
-  D.tenkan = new Array(n).fill(NaN); D.kijun = new Array(n).fill(NaN);
-  D.cloudTop = new Array(n).fill(NaN); D.cloudBot = new Array(n).fill(NaN);
-  for (let i = 51; i < n; i++) { D.tenkan[i] = hl(i, 9); D.kijun[i] = hl(i, 26); }
-  for (let i = 51 + 26; i < n; i++) {
-    const j = i - 26;
-    const a = (D.tenkan[j] + D.kijun[j]) / 2, b = hl(j, 52);
-    D.cloudTop[i] = Math.max(a, b); D.cloudBot[i] = Math.min(a, b);
-  }
-  // Higher timeframe (4h) trend, using only completed 4h bars
-  D.h4up = new Array(n).fill(0);
-  let h4ema = NaN, h4state = 0, curId = null;
-  const k4 = 2 / 51;
-  for (let i = 0; i < n; i++) {
-    const id = Math.floor(bars[i].t / 14400000);
-    if (curId !== null && id !== curId) {
-      const closed = c[i - 1];
-      h4ema = isNaN(h4ema) ? closed : closed * k4 + h4ema * (1 - k4);
-      h4state = closed > h4ema ? 1 : -1;
-    }
-    curId = id;
-    D.h4up[i] = h4state;
-  }
-  // Previous UTC day high and low, and today's Asian range (00:00 to 07:00 UTC)
-  D.pdH = new Array(n).fill(NaN); D.pdL = new Array(n).fill(NaN);
-  let day = null, dH = -Infinity, dL = Infinity, pH = NaN, pL = NaN;
-  for (let i = 0; i < n; i++) {
-    const d = new Date(bars[i].t).toISOString().slice(0, 10);
-    if (d !== day) { if (day !== null) { pH = dH; pL = dL; } day = d; dH = -Infinity; dL = Infinity; }
-    D.pdH[i] = pH; D.pdL[i] = pL;
-    if (h[i] > dH) dH = h[i];
-    if (l[i] < dL) dL = l[i];
-  }
-  // typical spread, to reject abnormal spreads
-  const sps = D.sp.filter(function (x) { return x > 0; }).sort(function (a, b) { return a - b; });
-  D.medSp = sps.length ? sps[Math.floor(sps.length / 2)] : 0;
-  return D;
 }
 
