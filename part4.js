@@ -1,3 +1,248 @@
+function btLine(label, s) {
+  if (!s || s.n === 0) return md(label) + ': no trades';
+  const wr = Math.round(s.w / s.n * 100);
+  const mark = s.n < 50 ? ' ⚠️' : (wr >= 55 && s.n >= 100 ? ' ✅' : '');
+  return md(label) + ': ' + md(wr) + '% \\(' + md(s.n) + ' trades\\)' + mark;
+}
+
+function btReport(res, pairCount) {
+  const lines = ['📊 *Backtest*', 'Past 1\\-min candles, ' + md(pairCount) + ' markets\\. Break\\-even is about 53%\\.', '⚠️ \\= too few trades  ✅ \\= 55%\\+ with 100\\+ trades', ''];
+  BT_LENGTHS.forEach(function (N) {
+    lines.push('*' + N + ' min trades*');
+    STRATEGIES.forEach(function (k) { lines.push(btLine(STRAT_NAMES[k], res[N].strat[k])); });
+    lines.push(btLine('Combined rule', res[N].strat.combo));
+    const best = Object.keys(res[N].pairs)
+      .filter(function (s) { return res[N].pairs[s].n >= 15; })
+      .sort(function (a, b) { return res[N].pairs[b].w / res[N].pairs[b].n - res[N].pairs[a].w / res[N].pairs[a].n; })
+      .slice(0, 3);
+    if (best.length) lines.push('Best markets: ' + best.map(function (s) { return md(s) + ' ' + md(Math.round(res[N].pairs[s].w / res[N].pairs[s].n * 100)) + '%'; }).join(', '));
+    lines.push('');
+  });
+  return lines.join('\n');
+}
+
+function fetchHistory(key, errors) {
+  const sizes = [5000, 2000, 1000];
+  const attempt = function (i) {
+    return fetchCandles(SYMBOL_MAP[key], sizes[i], 45000).then(function (p) {
+      if (p.length < 120) throw new Error('only ' + p.length + ' candles');
+      return p;
+    }).catch(function (e) {
+      errors.push(key + ' (' + sizes[i] + '): ' + e.message);
+      if (i + 1 < sizes.length) return attempt(i + 1);
+      return null;
+    });
+  };
+  return attempt(0);
+}
+
+function runBacktest() {
+  const keys = Object.keys(SYMBOL_MAP);
+  const data = {};
+  const errors = [];
+  return keys.reduce(function (chain, key) {
+    return chain.then(function () {
+      return fetchHistory(key, errors).then(function (p) { if (p) data[key] = p; });
+    });
+  }, Promise.resolve()).then(function () {
+    const got = Object.keys(data);
+    if (got.length === 0) {
+      throw new Error('No market data could be loaded. ' + (errors[0] || ''));
+    }
+    return btReport(backtestFromData(data), got.length);
+  });
+}
+
+// ---------- Deep test: months of history + stop loss / take profit ----------
+// /deeptest downloads many pages of 1-min candles, then tests
+//  (a) plain Rise/Fall wins, and (b) trades with a stop loss and take profit.
+// Results in R units: 1R = the amount risked on one trade.
+
+let deepRunning = false;
+const DEEP_PAGES = Number(process.env.DEEP_PAGES || 8);   // 5000 candles per page
+const COST_R = 0.1;        // assumed cost per trade, in R (spread / commission)
+const MAX_HOLD = 60;       // close a trade after 60 candles if no stop or target hit
+const SLTP_CONFIGS = [{ sl: 1, tp: 2, name: '1:2' }, { sl: 1, tp: 3, name: '1:3' }];
+const DEEP_STRATS = STRATEGIES.concat(['combo', 'random']);
+const DEEP_NAMES = { rsi: 'RSI', macd: 'MACD', trend: 'Trend', bands: 'Bollinger', breakout: 'Breakout', combo: 'Combined', random: 'Random' };
+const REAL_KEYS = ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCAD', 'GOLD', 'SILVER'];
+
+function fetchCandlesFull(derivSymbol, count, endEpoch) {
+  return wsRequest(PUBLIC_WS, {
+    ticks_history: derivSymbol,
+    adjust_start_time: 1,
+    count: count,
+    end: endEpoch || 'latest',
+    start: 1,
+    style: 'candles',
+    granularity: 60,
+  }, 45000).then(function (msg) {
+    return (msg.candles || []).map(function (c) {
+      return { t: Number(c.epoch), h: Number(c.high), l: Number(c.low), c: Number(c.close) };
+    });
+  });
+}
+
+// Download several pages, newest first, and join them oldest to newest
+function fetchPaged(key, pages, errors) {
+  let all = [];
+  const step = function (p, end) {
+    if (p >= pages) return Promise.resolve(all);
+    return fetchCandlesFull(SYMBOL_MAP[key], 5000, end).then(function (chunk) {
+      if (!chunk.length) return all;
+      all = chunk.concat(all);
+      return step(p + 1, chunk[0].t - 1);
+    }).catch(function (e) {
+      errors.push(key + ' page ' + (p + 1) + ': ' + e.message);
+      return all;
+    });
+  };
+  return step(0, null);
+}
+
+function atrAt(c, i) {
+  let sum = 0;
+  for (let j = i - 13; j <= i; j++) {
+    const pc = c[j - 1].c;
+    sum += Math.max(c[j].h - c[j].l, Math.abs(c[j].h - pc), Math.abs(c[j].l - pc));
+  }
+  return sum / 14;
+}
+
+// One stop loss / take profit simulation for one strategy on one market
+function simSLTP(c, voteAt, cfg, out) {
+  let i = 79;
+  while (i < c.length - 2) {
+    const v = voteAt(i);
+    if (v === 0) { i++; continue; }
+    const atr = atrAt(c, i);
+    if (!(atr > 0)) { i++; continue; }
+    const entry = c[i].c;
+    const sl = cfg.sl * atr;
+    const tp = cfg.tp * atr;
+    const last = Math.min(i + MAX_HOLD, c.length - 1);
+    let R = null;
+    let j = i + 1;
+    for (; j <= last; j++) {
+      const hitSL = v > 0 ? c[j].l <= entry - sl : c[j].h >= entry + sl;
+      const hitTP = v > 0 ? c[j].h >= entry + tp : c[j].l <= entry - tp;
+      if (hitSL) { R = -1; break; }          // if both hit in one candle, assume the stop came first
+      if (hitTP) { R = cfg.tp / cfg.sl; break; }
+    }
+    if (R === null) {
+      j = last;
+      const move = v > 0 ? c[last].c - entry : entry - c[last].c;
+      R = Math.max(-1, Math.min(cfg.tp / cfg.sl, move / sl));
+    }
+    out.n++;
+    if (R > 0) out.w++;
+    out.sumR += R - COST_R;
+    i = j + 1;
+  }
+}
+
+function emptyAgg() {
+  const a = { rf: {}, sl: {} };
+  ['real', 'synth'].forEach(function (g) {
+    a.rf[g] = {};
+    [5, 15].forEach(function (N) {
+      a.rf[g][N] = {};
+      DEEP_STRATS.forEach(function (k) { a.rf[g][N][k] = { n: 0, w: 0 }; });
+    });
+    a.sl[g] = {};
+    SLTP_CONFIGS.forEach(function (cfg) {
+      a.sl[g][cfg.name] = {};
+      DEEP_STRATS.forEach(function (k) { a.sl[g][cfg.name][k] = { n: 0, w: 0, sumR: 0 }; });
+    });
+  });
+  return a;
+}
+
+// Test one market and add its results to the totals
+function deepProcess(key, c, agg) {
+  const g = REAL_KEYS.indexOf(key) >= 0 ? 'real' : 'synth';
+  const cl = c.map(function (x) { return x.c; });
+  const votesAt = [];
+  for (let i = 79; i < cl.length; i++) votesAt[i] = getVotes(cl.slice(i - 79, i + 1)).votes;
+
+  let seed = 12345 + key.length * 977;
+  const rnd = function () { seed = (seed + 0x6D2B79F5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  const voteFor = function (k) {
+    if (k === 'random') return function () { return rnd() < 0.5 ? 1 : -1; };
+    if (k === 'combo') return function (i) { return comboVote(votesAt[i]); };
+    return function (i) { return votesAt[i][k]; };
+  };
+
+  DEEP_STRATS.forEach(function (k) {
+    [5, 15].forEach(function (N) {
+      const vf = voteFor(k);
+      const o = agg.rf[g][N][k];
+      let i = 79;
+      while (i < cl.length - N) {
+        const v = vf(i);
+        if (v === 0) { i++; continue; }
+        const won = (v > 0 && cl[i + N] > cl[i]) || (v < 0 && cl[i + N] < cl[i]);
+        o.n++;
+        if (won) o.w++;
+        i += N;
+      }
+    });
+    SLTP_CONFIGS.forEach(function (cfg) {
+      simSLTP(c, voteFor(k), cfg, agg.sl[g][cfg.name][k]);
+    });
+  });
+}
+
+function pct(o) { return o.n ? Math.round(o.w / o.n * 100) : 0; }
+
+function deepReport(agg, info) {
+  const GL = { real: 'Forex and metals', synth: 'Volatility indices' };
+  const L = [];
+  L.push('📊 *' + md('Deep test') + '*');
+  L.push(md(info.markets + ' markets, about ' + info.days + ' days of 1-min candles.'));
+  L.push(md('Stop-loss tests assume a cost of ' + COST_R + 'R per trade.'));
+  L.push('');
+  L.push('*' + md('Rise/Fall (break-even about 53%)') + '*');
+  ['real', 'synth'].forEach(function (g) {
+    [5, 15].forEach(function (N) {
+      const parts = DEEP_STRATS.map(function (k) {
+        const o = agg.rf[g][N][k];
+        if (!o.n) return DEEP_NAMES[k] + ' none';
+        const mark = o.n < 100 ? ' ⚠️' : (pct(o) >= 55 && o.n >= 300 ? ' ✅' : '');
+        return DEEP_NAMES[k] + ' ' + pct(o) + '% (' + o.n + ')' + mark;
+      });
+      L.push(md(GL[g] + ', ' + N + ' min: ' + parts.join(' | ')));
+    });
+  });
+  L.push('');
+  L.push('*' + md('Stop loss and take profit (average R per trade)') + '*');
+  const found = [];
+  SLTP_CONFIGS.forEach(function (cfg) {
+    ['real', 'synth'].forEach(function (g) {
+      const base = agg.sl[g][cfg.name].random;
+      const baseR = base.n ? base.sumR / base.n : 0;
+      const parts = DEEP_STRATS.map(function (k) {
+        const o = agg.sl[g][cfg.name][k];
+        if (!o.n) return DEEP_NAMES[k] + ' none';
+        const r = o.sumR / o.n;
+        const good = k !== 'random' && o.n >= 300 && r >= 0.1 && r - baseR >= 0.08;
+        if (good) found.push(DEEP_NAMES[k] + ' on ' + GL[g] + ' with ' + cfg.name + ' (' + (r >= 0 ? '+' : '') + r.toFixed(2) + 'R, ' + o.n + ' trades)');
+        return DEEP_NAMES[k] + ' ' + (r >= 0 ? '+' : '') + r.toFixed(2) + 'R ' + pct(o) + '% (' + o.n + ')' + (good ? ' ✅' : (o.n < 100 ? ' ⚠️' : ''));
+      });
+      L.push(md(GL[g] + ', stop ' + cfg.name + ': ' + parts.join(' | ')));
+    });
+  });
+  L.push('');
+  if (found.length) {
+    L.push('*' + md('Possible edge:') + '*');
+    found.slice(0, 4).forEach(function (f) { L.push(md('• ' + f)); });
+    L.push(md('Still treat this as a lead to confirm on demo, not proof.'));
+  } else {
+    L.push('*' + md('Verdict: no strategy clearly beats random entries.') + '*');
+  }
+  return L.join('\n');
+}
+
 function runDeepTest() {
   const keys = Object.keys(SYMBOL_MAP);
   const agg = emptyAgg();
@@ -206,337 +451,5 @@ function stBuild(bars) {
   const sps = D.sp.filter(function (x) { return x > 0; }).sort(function (a, b) { return a - b; });
   D.medSp = sps.length ? sps[Math.floor(sps.length / 2)] : 0;
   return D;
-}
-
-// ----- signal generators: +1 buy, -1 sell, 0 nothing. Signal at close of bar i. -----
-function stSignals(key, D, seed) {
-  const n = D.n, sig = new Int8Array(n);
-  const c = D.c, o = D.o, h = D.h, l = D.l;
-  let st = null, rngSeed = seed;
-  const rnd = function () { rngSeed = (rngSeed + 0x6D2B79F5) | 0; let t = Math.imul(rngSeed ^ (rngSeed >>> 15), 1 | rngSeed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
-  let res = NaN, sup = NaN;
-  let aDay = null, aHi = -Infinity, aLo = Infinity, aFiredUp = false, aFiredDn = false;
-  for (let i = ST_WARM; i < n; i++) {
-    const atr = D.atr[i];
-    let s = 0;
-    if (key === 'ema') {
-      if (D.ema20[i - 1] <= D.ema50[i - 1] && D.ema20[i] > D.ema50[i] && c[i] > D.ema200[i]) s = 1;
-      else if (D.ema20[i - 1] >= D.ema50[i - 1] && D.ema20[i] < D.ema50[i] && c[i] < D.ema200[i]) s = -1;
-    } else if (key === 'mtf') {
-      if (D.ema20[i - 1] <= D.ema50[i - 1] && D.ema20[i] > D.ema50[i] && D.h4up[i] === 1) s = 1;
-      else if (D.ema20[i - 1] >= D.ema50[i - 1] && D.ema20[i] < D.ema50[i] && D.h4up[i] === -1) s = -1;
-    } else if (key === 'pull') {
-      let minR = 100, maxR = 0;
-      for (let k = i - 5; k < i; k++) { if (D.rsi[k] < minR) minR = D.rsi[k]; if (D.rsi[k] > maxR) maxR = D.rsi[k]; }
-      if (D.ema50[i] > D.ema200[i] && c[i] > D.ema200[i] && D.adx[i] > 20 && minR < 40 &&
-          D.rsi[i] > D.rsi[i - 1] && l[i] <= D.ema50[i] + 0.5 * atr && c[i] > D.ema50[i] && c[i] > o[i]) s = 1;
-      else if (D.ema50[i] < D.ema200[i] && c[i] < D.ema200[i] && D.adx[i] > 20 && maxR > 60 &&
-          D.rsi[i] < D.rsi[i - 1] && h[i] >= D.ema50[i] - 0.5 * atr && c[i] < D.ema50[i] && c[i] < o[i]) s = -1;
-    } else if (key === 'adx') {
-      if (D.adx[i] > 20 && D.pdi[i - 1] <= D.mdi[i - 1] && D.pdi[i] > D.mdi[i] && D.ema20[i] > D.ema50[i]) s = 1;
-      else if (D.adx[i] > 20 && D.pdi[i - 1] >= D.mdi[i - 1] && D.pdi[i] < D.mdi[i] && D.ema20[i] < D.ema50[i]) s = -1;
-    } else if (key === 'donch') {
-      if (c[i] > D.dHi[i]) s = 1; else if (c[i] < D.dLo[i]) s = -1;
-    } else if (key === 'srb') {
-      const k = i - 5;
-      if (k >= 5) {
-        let isH = true, isL = true;
-        for (let m = k - 5; m <= k + 5; m++) { if (h[m] > h[k]) isH = false; if (l[m] < l[k]) isL = false; }
-        if (isH) res = h[k];
-        if (isL) sup = l[k];
-      }
-      if (!isNaN(res) && c[i] > res && c[i - 1] <= res) { s = 1; res = NaN; }
-      else if (!isNaN(sup) && c[i] < sup && c[i - 1] >= sup) { s = -1; sup = NaN; }
-    } else if (key === 'retest') {
-      if (st && i - st.bar > 12) st = null;
-      if (st) {
-        if (st.dir === 1) {
-          if (c[i] < st.level - atr) st = null;
-          else if (l[i] <= st.level + 0.3 * atr && c[i] > st.level && c[i] > o[i]) { s = 1; st = null; }
-        } else {
-          if (c[i] > st.level + atr) st = null;
-          else if (h[i] >= st.level - 0.3 * atr && c[i] < st.level && c[i] < o[i]) { s = -1; st = null; }
-        }
-      }
-      if (!st && s === 0) {
-        if (c[i] > D.dHi[i]) st = { dir: 1, level: D.dHi[i], bar: i };
-        else if (c[i] < D.dLo[i]) st = { dir: -1, level: D.dLo[i], bar: i };
-      }
-    } else if (key === 'asian') {
-      const dt = new Date(D.bars[i].t);
-      const d = dt.toISOString().slice(0, 10), hr = dt.getUTCHours();
-      if (d !== aDay) { aDay = d; aHi = -Infinity; aLo = Infinity; aFiredUp = false; aFiredDn = false; }
-      if (hr < 7) { if (h[i] > aHi) aHi = h[i]; if (l[i] < aLo) aLo = l[i]; }
-      else if (hr < 12 && aHi > aLo && (aHi - aLo) > 0.5 * atr) {
-        if (c[i] > aHi && !aFiredUp) { s = 1; aFiredUp = true; }
-        else if (c[i] < aLo && !aFiredDn) { s = -1; aFiredDn = true; }
-      }
-    } else if (key === 'bbmr') {
-      if (D.adx[i] < 22) {
-        if (c[i - 1] < D.bbL[i - 1] && c[i] > D.bbL[i]) s = 1;
-        else if (c[i - 1] > D.bbU[i - 1] && c[i] < D.bbU[i]) s = -1;
-      }
-    } else if (key === 'rsimr') {
-      if (D.adx[i] < 22) {
-        if (D.rsi[i - 1] < 30 && D.rsi[i] >= 30) s = 1;
-        else if (D.rsi[i - 1] > 70 && D.rsi[i] <= 70) s = -1;
-      }
-    } else if (key === 'macd') {
-      if (D.hist[i - 1] <= 0 && D.hist[i] > 0 && c[i] > D.ema200[i]) s = 1;
-      else if (D.hist[i - 1] >= 0 && D.hist[i] < 0 && c[i] < D.ema200[i]) s = -1;
-    } else if (key === 'candle') {
-      if (c[i - 1] < o[i - 1] && c[i] > o[i] && c[i] >= o[i - 1] && o[i] <= c[i - 1] && l[i] <= D.p10Lo[i]) s = 1;
-      else if (c[i - 1] > o[i - 1] && c[i] < o[i] && c[i] <= o[i - 1] && o[i] >= c[i - 1] && h[i] >= D.p10Hi[i]) s = -1;
-    } else if (key === 'pday') {
-      if (!isNaN(D.pdH[i])) {
-        if (c[i] > D.pdH[i] && c[i - 1] <= D.pdH[i]) s = 1;
-        else if (c[i] < D.pdL[i] && c[i - 1] >= D.pdL[i]) s = -1;
-      }
-    } else if (key === 'atrb') {
-      const prevAtr = D.atr[i - 1];
-      if (c[i] - c[i - 1] > 1.5 * prevAtr && c[i] > D.ema50[i]) s = 1;
-      else if (c[i - 1] - c[i] > 1.5 * prevAtr && c[i] < D.ema50[i]) s = -1;
-    } else if (key === 'ichi') {
-      if (!isNaN(D.cloudTop[i])) {
-        if (c[i] > D.cloudTop[i] && D.tenkan[i - 1] <= D.kijun[i - 1] && D.tenkan[i] > D.kijun[i]) s = 1;
-        else if (c[i] < D.cloudBot[i] && D.tenkan[i - 1] >= D.kijun[i - 1] && D.tenkan[i] < D.kijun[i]) s = -1;
-      }
-    } else if (key === 'rand') {
-      if (rnd() < 0.03) s = rnd() < 0.5 ? 1 : -1;
-    }
-    sig[i] = s;
-  }
-  return sig;
-}
-
-function stRegime(D, i) {
-  let sum = 0, cnt = 0;
-  for (let k = Math.max(0, i - 100); k <= i; k++) { if (D.atr[k] > 0) { sum += D.atr[k]; cnt++; } }
-  const avg = cnt ? sum / cnt : D.atr[i];
-  if (D.atr[i] > 1.5 * avg) return 'volatile';
-  if (D.adx[i] > 25) return 'trending';
-  if (D.adx[i] < 20) return 'ranging';
-  return 'mixed';
-}
-
-function stNewAcc() { return { n: 0, w: 0, sumR: 0, gp: 0, gl: 0 }; }
-function stAdd(a, r) { a.n++; if (r > 0) { a.w++; a.gp += r; } else a.gl += -r; a.sumR += r; }
-
-// One strategy, one market, one stop/target setting
-function stSim(D, sig, v, split, accP, rej, rows, regAcc, mkt, sname) {
-  let i = ST_WARM;
-  while (i < D.n - 2) {
-    const s = sig[i];
-    if (s === 0) { i++; continue; }
-    const e = i + 1;
-    const atr = D.atr[i];
-    if (!(atr > 0)) { rej.noAtr++; i++; continue; }
-    if (D.sp[e] > 3 * D.medSp && D.medSp > 0) { rej.wideSpread++; i++; continue; }
-    const entry = D.o[e];
-    const sl = v.sl * atr, tp = sl * v.rr;
-    const stop = s > 0 ? entry - sl : entry + sl;
-    const target = s > 0 ? entry + tp : entry - tp;
-    const last = Math.min(e + ST_MAXHOLD, D.n - 1);
-    let R = null, j = e;
-    for (; j <= last; j++) {
-      if (s > 0) {
-        if (j > e && D.o[j] <= stop) { R = (D.o[j] - entry) / sl; break; }
-        if (D.l[j] <= stop) { R = -1; break; }
-        if (D.h[j] >= target) { R = v.rr; break; }
-      } else {
-        if (j > e && D.o[j] >= stop) { R = (entry - D.o[j]) / sl; break; }
-        if (D.h[j] >= stop) { R = -1; break; }
-        if (D.l[j] <= target) { R = v.rr; break; }
-      }
-    }
-    if (R === null) { j = last; R = ((D.c[j] - entry) * s) / sl; }
-    const nights = Math.floor((j - e) / 24);
-    const net = R - (D.sp[e] * (1 + STRAT_SLIP)) / sl - nights * STRAT_SWAP_R;
-    const period = i < split[0] ? 0 : (i < split[1] ? 1 : 2);
-    stAdd(accP[period], net);
-    for (let k = i + 1; k <= j; k++) if (sig[k] !== 0) rej.overlap++;
-    if (rows) {
-      rows.push({
-        s: sname, m: mkt, p: period, t: D.bars[e].t, x: D.bars[j].t, d: s, r: net,
-        g: stRegime(D, i),
-      });
-    }
-    if (regAcc) stAdd(regAcc[stRegime(D, i)], net);
-    i = j + 1;
-  }
-}
-
-function stPF(a) { return a.gl > 0 ? a.gp / a.gl : (a.gp > 0 ? 99 : 0); }
-function stExp(a) { return a.n ? a.sumR / a.n : 0; }
-function stF(x, d) { return (x >= 0 ? '+' : '') + x.toFixed(d === undefined ? 2 : d); }
-
-function stMaxDD(trades) {
-  const t = trades.slice().sort(function (a, b) { return a.x - b.x; });
-  let eq = 0, peak = 0, dd = 0;
-  t.forEach(function (r) { eq += r.r; if (eq > peak) peak = eq; if (peak - eq > dd) dd = peak - eq; });
-  return dd;
-}
-
-function stSendCsv(rows) {
-  if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) return Promise.resolve(false);
-  const head = 'strategy,market,period,entry_time_utc,exit_time_utc,direction,net_R,regime\n';
-  const names = ['train', 'validation', 'out_of_sample'];
-  const body = rows.map(function (r) {
-    return [r.s, r.m, names[r.p], new Date(r.t).toISOString(), new Date(r.x).toISOString(), r.d > 0 ? 'BUY' : 'SELL', r.r.toFixed(3), r.g].join(',');
-  }).join('\n');
-  const fd = new FormData();
-  fd.append('chat_id', String(TELEGRAM_CHAT_ID));
-  fd.append('caption', 'Every simulated trade (default stop and target)');
-  fd.append('document', new Blob([head + body], { type: 'text/csv' }), 'strategy_trades.csv');
-  return fetch('https://api.telegram.org/bot' + TELEGRAM_TOKEN + '/sendDocument', { method: 'POST', body: fd })
-    .then(function (r) { return r.json(); }).then(function (j) { return j.ok === true; })
-    .catch(function () { return false; });
-}
-
-function runStrategyTest() {
-  if (!CAP_ON) return Promise.reject(new Error('Capital.com keys are missing. This test uses Capital.com hourly candles.'));
-  const errors = [];
-  const rej = {};
-  const acc = {};      // key -> variant -> period -> acc
-  const reg = {};      // key -> regime -> acc (default variant)
-  const allRows = [];
-  const rowsByStrat = {};
-  ST_STRATS.forEach(function (s) {
-    acc[s[0]] = ST_VARIANTS.map(function () { return [stNewAcc(), stNewAcc(), stNewAcc()]; });
-    reg[s[0]] = { trending: stNewAcc(), ranging: stNewAcc(), volatile: stNewAcc(), mixed: stNewAcc() };
-    rej[s[0]] = { overlap: 0, wideSpread: 0, noAtr: 0 };
-    rowsByStrat[s[0]] = [];
-  });
-  let usedMarkets = [], totalBars = 0, minT = Infinity, maxT = 0;
-
-  return ST_MARKETS.reduce(function (chain, sym) {
-    return chain.then(function () {
-      return stFetchHistory(sym, STRAT_PAGES, errors).then(function (bars) {
-        if (bars.length < 1000) { errors.push(sym + ': only ' + bars.length + ' bars'); return null; }
-        usedMarkets.push(sym);
-        totalBars += bars.length;
-        minT = Math.min(minT, bars[0].t); maxT = Math.max(maxT, bars[bars.length - 1].t);
-        const D = stBuild(bars);
-        const split = [Math.floor(D.n * 0.5), Math.floor(D.n * 0.75)];
-        ST_STRATS.forEach(function (s, si) {
-          const sig = stSignals(s[0], D, 1000 + si * 77 + sym.length);
-          ST_VARIANTS.forEach(function (v, vi) {
-            const first = vi === 0;
-            const rows = first ? [] : null;
-            stSim(D, sig, v, split, acc[s[0]][vi], first ? rej[s[0]] : { overlap: 0, wideSpread: 0, noAtr: 0 },
-              rows, first ? reg[s[0]] : null, sym, s[1]);
-            if (rows) { rows.forEach(function (r) { rowsByStrat[s[0]].push(r); allRows.push(r); }); }
-          });
-        });
-        return new Promise(function (r) { setImmediate(r); });
-      });
-    });
-  }, Promise.resolve()).then(function () {
-    if (usedMarkets.length === 0) throw new Error('No history could be loaded. ' + (errors[0] || ''));
-    const days = Math.round((maxT - minT) / 86400000);
-    const msgs = [];
-    const head = [];
-    head.push('📊 *' + md('Strategy research') + '*');
-    head.push(md(usedMarkets.length + ' markets (' + usedMarkets.join(', ') + '), ' + totalBars + ' hourly bars, up to ' + days + ' days.'));
-    head.push(md('Chronological split: train 50% / validation 25% / out-of-sample 25%. Costs: real spread + ' + STRAT_SLIP + 'x slippage' + (STRAT_SWAP_R ? ', swap ' + STRAT_SWAP_R + 'R/night' : '; swap not modeled') + '.'));
-    head.push(md('Expectancy is net R per trade (1R = the stop distance). Parameters were fixed in advance, nothing was tuned on this data.'));
-    if (errors.length) head.push(md('Notes: ' + errors.slice(0, 3).join(' | ')));
-    msgs.push(head.join('\n'));
-
-    const randOos = acc.rand[0][2];
-    const randExp = stExp(randOos);
-    const lines = ['*' + md('Net expectancy (R/trade): train | validation | out-of-sample') + '*'];
-    const cands = [];
-    ST_STRATS.forEach(function (s) {
-      const k = s[0];
-      const a = acc[k][0];
-      const tot = a[0].n + a[1].n + a[2].n;
-      const exps = a.map(stExp);
-      const oosPF = stPF(a[2]);
-      const dd = stMaxDD(rowsByStrat[k]);
-      let posVar = 0;
-      ST_VARIANTS.forEach(function (v, vi) { if (stExp(acc[k][vi][2]) > 0) posVar++; });
-      let verdict;
-      if (k === 'rand') verdict = 'control';
-      else if (a[0].n < 30 || a[1].n < 30 || a[2].n < 30) verdict = 'too few trades';
-      else if (exps[0] >= 0.05 && exps[1] >= 0.05 && exps[2] >= 0.05 && oosPF >= 1.15 && posVar >= 3 && exps[2] - randExp >= 0.05) {
-        verdict = 'CANDIDATE'; cands.push(k);
-      } else verdict = 'reject';
-      const mark = verdict === 'CANDIDATE' ? ' ✅' : '';
-      lines.push(md(s[1] + ': ' + stF(exps[0]) + ' | ' + stF(exps[1]) + ' | ' + stF(exps[2]) +
-        '  (n ' + a[0].n + '/' + a[1].n + '/' + a[2].n + ')  OOS PF ' + oosPF.toFixed(2) + ', win ' + (a[2].n ? Math.round(100 * a[2].w / a[2].n) : 0) +
-        '%, max DD ' + dd.toFixed(1) + 'R, ' + posVar + '/5 settings positive -> ' + verdict) + mark);
-    });
-    msgs.push(lines.join('\n'));
-
-    // Regime split and rejections
-    const rl = ['*' + md('Results by market condition (net R/trade, trades)') + '*'];
-    ST_STRATS.forEach(function (s) {
-      const r = reg[s[0]];
-      const f = function (x) { return x.n ? stF(stExp(x)) + ' (' + x.n + ')' : 'none'; };
-      rl.push(md(s[1] + ': trending ' + f(r.trending) + ' | ranging ' + f(r.ranging) + ' | volatile ' + f(r.volatile) + ' | mixed ' + f(r.mixed)));
-    });
-    rl.push('');
-    rl.push(md('Rejected signals (all strategies): ' + (function () {
-      let ov = 0, ws = 0, na = 0;
-      Object.keys(rej).forEach(function (k) { ov += rej[k].overlap; ws += rej[k].wideSpread; na += rej[k].noAtr; });
-      return ov + ' overlapping a trade, ' + ws + ' with spread over 3x normal, ' + na + ' with no ATR.';
-    })()));
-    msgs.push(rl.join('\n'));
-
-    const fin = [];
-    if (cands.length) {
-      fin.push('*' + md('Worth demo testing next (not proven):') + '*');
-      cands.forEach(function (k) {
-        const a = acc[k][0];
-        const net = a[0].sumR + a[1].sumR + a[2].sumR;
-        fin.push(md('• ' + ST_STRATS.filter(function (x) { return x[0] === k; })[0][1] + ': total ' + stF(net, 1) + 'R, about ' + stF(net * capRisk, 0) + ' dollars at $' + capRisk + ' risk per trade'));
-      });
-      fin.push(md('Out-of-sample is a single period, so even candidates can be luck. Confirm on demo before trusting them.'));
-    } else {
-      fin.push('*' + md('Verdict: no module passed all tests (positive in train, validation and out-of-sample, profit factor 1.15+, stable across settings, and better than random entries).') + '*');
-      fin.push(md('Do not use win rate alone to judge any of these. Nothing here supports going live.'));
-    }
-    msgs.push(fin.join('\n'));
-    return { msgs: msgs, rows: allRows };
-  });
-}
-
-// ---------- Volatile-market mode ----------
-// "Volatile" = the hourly ATR is more than VOL_MULT times its average over the last 100 hours.
-// /volatiletest checks, on history, whether trading only in those conditions helps.
-// /volatile on makes the Capital.com demo trades wait for volatile conditions (off by default).
-let volatileMode = process.env.VOLATILE_MODE === 'on';
-const VOL_MULT = Number(process.env.VOL_MULT || 1.5);
-let volRunning = false;
-const volStats = { n: 0, sum: 0, w: 0 };
-
-function stIsVol(D, i, mult) {
-  let sum = 0, cnt = 0;
-  for (let k = Math.max(0, i - 100); k <= i; k++) { if (D.atr[k] > 0) { sum += D.atr[k]; cnt++; } }
-  const avg = cnt ? sum / cnt : D.atr[i];
-  return D.atr[i] > mult * avg;
-}
-
-// Live check for one Capital.com market
-function volatileNow(symbol) {
-  return capEpic(symbol).then(function (epic) {
-    return capCall('GET', '/prices/' + epic + '?resolution=HOUR&max=130');
-  }).then(function (j) {
-    const p = j.prices || [];
-    const mid = function (o) { return (Number(o.bid) + Number(o.ask)) / 2; };
-    if (p.length < 120) return { ok: false, ratio: 0 };
-    const tr = [];
-    for (let i = 1; i < p.length; i++) {
-      const h = mid(p[i].highPrice), l = mid(p[i].lowPrice), pc = mid(p[i - 1].closePrice);
-      tr.push(Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc)));
-    }
-    const atrAt = function (end) { let s = 0; for (let k = end - 13; k <= end; k++) s += tr[k]; return s / 14; };
-    const now = atrAt(tr.length - 1);
-    let s2 = 0, c2 = 0;
-    for (let e = tr.length - 100; e < tr.length; e++) { s2 += atrAt(e); c2++; }
-    const ratio = now / (s2 / c2);
-    return { ok: ratio > VOL_MULT, ratio: ratio };
-  });
 }
 
