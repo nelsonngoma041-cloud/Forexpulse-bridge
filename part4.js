@@ -1,9 +1,219 @@
+function runDeepTest() {
+  const keys = Object.keys(SYMBOL_MAP);
+  const agg = emptyAgg();
+  const errors = [];
+  let markets = 0;
+  let maxSpan = 0;
+  return keys.reduce(function (chain, key) {
+    return chain.then(function () {
+      return fetchPaged(key, DEEP_PAGES, errors).then(function (c) {
+        if (!c || c.length < 500) return null;
+        markets++;
+        maxSpan = Math.max(maxSpan, (c[c.length - 1].t - c[0].t) / 86400);
+        deepProcess(key, c, agg);
+        return new Promise(function (r) { setImmediate(r); });
+      });
+    });
+  }, Promise.resolve()).then(function () {
+    if (markets === 0) throw new Error('No market data could be loaded. ' + (errors[0] || ''));
+    if (errors.length) console.error('Deep test notes: ' + errors.slice(0, 3).join(' | '));
+    return deepReport(agg, { markets: markets, days: Math.round(maxSpan) });
+  });
+}
+
+// ---------- Strategy research (/strategytest) ----------
+// Tests 15 strategy modules one at a time, plus a random-entry control, on hourly
+// Capital.com candles. Same data, costs and rules for every module.
+//  - Signal is read at the close of a bar; the trade enters at the NEXT bar open (no look-ahead).
+//  - One trade at a time per module and market (no duplicate or overlapping signals).
+//  - Stop loss = ATR x multiple, take profit = stop x RR, forced exit after 48 bars.
+//  - If stop and target are both inside one bar, the stop is assumed to hit first.
+//  - Cost per trade = the real bid/ask spread at entry, plus an assumed slippage (STRAT_SLIP).
+//  - Swap is NOT known; set STRAT_SWAP_R (R per night) if you want to model it.
+//  - Periods are chronological: first 50% train, next 25% validation, last 25% out-of-sample.
+// Nothing is optimised on the data: parameters are fixed in advance. Sensitivity runs only
+// show how results change if the stop and target are changed.
+
+let stratRunning = false;
+const STRAT_PAGES = Number(process.env.STRAT_PAGES || 8);        // 1000 hourly bars per page
+const STRAT_SLIP = Number(process.env.STRAT_SLIP || 0.5);        // extra slippage as a share of the spread
+const STRAT_SWAP_R = Number(process.env.STRAT_SWAP_R || 0);      // swap cost in R per night held
+const ST_WARM = 210;
+const ST_MAXHOLD = 48;
+const ST_MARKETS = ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCAD', 'GOLD'];
+const ST_VARIANTS = [
+  { sl: 1.5, rr: 2, name: 'SL1.5 RR2' },   // the default, listed first
+  { sl: 1.0, rr: 2, name: 'SL1.0 RR2' },
+  { sl: 2.0, rr: 2, name: 'SL2.0 RR2' },
+  { sl: 1.5, rr: 1.5, name: 'SL1.5 RR1.5' },
+  { sl: 1.5, rr: 3, name: 'SL1.5 RR3' },
+];
+const ST_STRATS = [
+  ['ema', 'EMA trend'], ['mtf', 'Multi-timeframe trend'], ['pull', 'Trend pullback'],
+  ['adx', 'ADX trend'], ['donch', 'Donchian breakout'], ['srb', 'S/R breakout'],
+  ['retest', 'Breakout retest'], ['asian', 'Asian range breakout'], ['bbmr', 'Bollinger reversion'],
+  ['rsimr', 'RSI reversion'], ['macd', 'MACD momentum'], ['candle', 'Candle reversal'],
+  ['pday', 'Prev-day breakout'], ['atrb', 'ATR breakout'], ['ichi', 'Ichimoku trend'],
+  ['rand', 'RANDOM (control)'],
+];
+
+function stIso(ms) { return new Date(ms).toISOString().slice(0, 19); }
+
+// Hourly candles from Capital.com, newest pages first, joined oldest to newest
+function stFetchHistory(symbol, pages, errors) {
+  return capEpic(symbol).then(function (epic) {
+    let all = [];
+    const step = function (p, to) {
+      if (p >= pages) return Promise.resolve(all);
+      return capCall('GET', '/prices/' + epic + '?resolution=HOUR&max=1000' + (to ? '&to=' + to : '')).then(function (j) {
+        const arr = (j.prices || []).map(function (x) {
+          const m = function (o) { return (Number(o.bid) + Number(o.ask)) / 2; };
+          return {
+            t: Date.parse((x.snapshotTimeUTC || x.snapshotTime) + 'Z'),
+            o: m(x.openPrice), h: m(x.highPrice), l: m(x.lowPrice), c: m(x.closePrice),
+            sp: Math.abs(Number(x.openPrice.ask) - Number(x.openPrice.bid)),
+          };
+        }).filter(function (b) { return !isNaN(b.t) && b.h > 0; });
+        if (!arr.length) return all;
+        arr.sort(function (a, b) { return a.t - b.t; });
+        all = arr.concat(all);
+        return step(p + 1, stIso(arr[0].t - 1000));
+      }).catch(function (e) {
+        errors.push(symbol + ' page ' + (p + 1) + ': ' + e.message);
+        return all;
+      });
+    };
+    return step(0, null);
+  }).then(function (all) {
+    const seen = {};
+    return all.filter(function (b) { if (seen[b.t]) return false; seen[b.t] = true; return true; })
+      .sort(function (a, b) { return a.t - b.t; });
+  });
+}
+
+// ----- indicators over arrays -----
+function stEma(a, p) {
+  const out = new Array(a.length);
+  const k = 2 / (p + 1);
+  out[0] = a[0];
+  for (let i = 1; i < a.length; i++) out[i] = a[i] * k + out[i - 1] * (1 - k);
+  return out;
+}
+function stWilder(a, p, start) {
+  const out = new Array(a.length).fill(NaN);
+  let sum = 0;
+  for (let i = start; i < start + p; i++) sum += a[i];
+  out[start + p - 1] = sum / p;
+  for (let i = start + p; i < a.length; i++) out[i] = (out[i - 1] * (p - 1) + a[i]) / p;
+  return out;
+}
+function stBuild(bars) {
+  const n = bars.length;
+  const o = bars.map(function (b) { return b.o; }), h = bars.map(function (b) { return b.h; });
+  const l = bars.map(function (b) { return b.l; }), c = bars.map(function (b) { return b.c; });
+  const D = { n: n, bars: bars, o: o, h: h, l: l, c: c, sp: bars.map(function (b) { return b.sp; }) };
+  const tr = [0], pdm = [0], mdm = [0];
+  for (let i = 1; i < n; i++) {
+    tr.push(Math.max(h[i] - l[i], Math.abs(h[i] - c[i - 1]), Math.abs(l[i] - c[i - 1])));
+    const up = h[i] - h[i - 1], dn = l[i - 1] - l[i];
+    pdm.push(up > dn && up > 0 ? up : 0);
+    mdm.push(dn > up && dn > 0 ? dn : 0);
+  }
+  D.atr = stWilder(tr, 14, 1);
+  const str = stWilder(tr, 14, 1), sp = stWilder(pdm, 14, 1), sm = stWilder(mdm, 14, 1);
+  D.pdi = new Array(n).fill(NaN); D.mdi = new Array(n).fill(NaN);
+  const dx = new Array(n).fill(0);
+  for (let i = 0; i < n; i++) {
+    if (str[i] > 0) {
+      D.pdi[i] = 100 * sp[i] / str[i]; D.mdi[i] = 100 * sm[i] / str[i];
+      const sum = D.pdi[i] + D.mdi[i];
+      dx[i] = sum > 0 ? 100 * Math.abs(D.pdi[i] - D.mdi[i]) / sum : 0;
+    }
+  }
+  D.adx = stWilder(dx, 14, 14);
+  D.ema20 = stEma(c, 20); D.ema50 = stEma(c, 50); D.ema200 = stEma(c, 200);
+  // RSI (Wilder)
+  const gain = [0], loss = [0];
+  for (let i = 1; i < n; i++) { const d = c[i] - c[i - 1]; gain.push(d > 0 ? d : 0); loss.push(d < 0 ? -d : 0); }
+  const ag = stWilder(gain, 14, 1), al = stWilder(loss, 14, 1);
+  D.rsi = ag.map(function (g, i) { return al[i] === 0 ? 100 : 100 - 100 / (1 + g / al[i]); });
+  // MACD histogram
+  const e12 = stEma(c, 12), e26 = stEma(c, 26);
+  const macdLine = e12.map(function (v, i) { return v - e26[i]; });
+  const sig9 = stEma(macdLine, 9);
+  D.hist = macdLine.map(function (v, i) { return v - sig9[i]; });
+  // Bollinger (20, 2)
+  D.bbU = new Array(n).fill(NaN); D.bbL = new Array(n).fill(NaN);
+  for (let i = 19; i < n; i++) {
+    let s = 0;
+    for (let k = i - 19; k <= i; k++) s += c[k];
+    const mean = s / 20;
+    let v = 0;
+    for (let k = i - 19; k <= i; k++) v += (c[k] - mean) * (c[k] - mean);
+    const sd = Math.sqrt(v / 20);
+    D.bbU[i] = mean + 2 * sd; D.bbL[i] = mean - 2 * sd;
+  }
+  // Donchian 20 of the PRIOR bars, and the 10 prior bars' extremes
+  D.dHi = new Array(n).fill(NaN); D.dLo = new Array(n).fill(NaN);
+  D.p10Hi = new Array(n).fill(NaN); D.p10Lo = new Array(n).fill(NaN);
+  for (let i = 20; i < n; i++) {
+    let hi = -Infinity, lo = Infinity;
+    for (let k = i - 20; k < i; k++) { if (h[k] > hi) hi = h[k]; if (l[k] < lo) lo = l[k]; }
+    D.dHi[i] = hi; D.dLo[i] = lo;
+    let hi2 = -Infinity, lo2 = Infinity;
+    for (let k = i - 10; k < i; k++) { if (h[k] > hi2) hi2 = h[k]; if (l[k] < lo2) lo2 = l[k]; }
+    D.p10Hi[i] = hi2; D.p10Lo[i] = lo2;
+  }
+  // Ichimoku (cloud shifted 26 bars forward, so no look-ahead)
+  const hl = function (i, p) {
+    let hi = -Infinity, lo = Infinity;
+    for (let k = i - p + 1; k <= i; k++) { if (h[k] > hi) hi = h[k]; if (l[k] < lo) lo = l[k]; }
+    return (hi + lo) / 2;
+  };
+  D.tenkan = new Array(n).fill(NaN); D.kijun = new Array(n).fill(NaN);
+  D.cloudTop = new Array(n).fill(NaN); D.cloudBot = new Array(n).fill(NaN);
+  for (let i = 51; i < n; i++) { D.tenkan[i] = hl(i, 9); D.kijun[i] = hl(i, 26); }
+  for (let i = 51 + 26; i < n; i++) {
+    const j = i - 26;
+    const a = (D.tenkan[j] + D.kijun[j]) / 2, b = hl(j, 52);
+    D.cloudTop[i] = Math.max(a, b); D.cloudBot[i] = Math.min(a, b);
+  }
+  // Higher timeframe (4h) trend, using only completed 4h bars
+  D.h4up = new Array(n).fill(0);
+  let h4ema = NaN, h4state = 0, curId = null;
+  const k4 = 2 / 51;
+  for (let i = 0; i < n; i++) {
+    const id = Math.floor(bars[i].t / 14400000);
+    if (curId !== null && id !== curId) {
+      const closed = c[i - 1];
+      h4ema = isNaN(h4ema) ? closed : closed * k4 + h4ema * (1 - k4);
+      h4state = closed > h4ema ? 1 : -1;
+    }
+    curId = id;
+    D.h4up[i] = h4state;
+  }
+  // Previous UTC day high and low, and today's Asian range (00:00 to 07:00 UTC)
+  D.pdH = new Array(n).fill(NaN); D.pdL = new Array(n).fill(NaN);
+  let day = null, dH = -Infinity, dL = Infinity, pH = NaN, pL = NaN;
+  for (let i = 0; i < n; i++) {
+    const d = new Date(bars[i].t).toISOString().slice(0, 10);
+    if (d !== day) { if (day !== null) { pH = dH; pL = dL; } day = d; dH = -Infinity; dL = Infinity; }
+    D.pdH[i] = pH; D.pdL[i] = pL;
+    if (h[i] > dH) dH = h[i];
+    if (l[i] < dL) dL = l[i];
+  }
+  // typical spread, to reject abnormal spreads
+  const sps = D.sp.filter(function (x) { return x > 0; }).sort(function (a, b) { return a - b; });
+  D.medSp = sps.length ? sps[Math.floor(sps.length / 2)] : 0;
+  return D;
+}
+
 // ----- signal generators: +1 buy, -1 sell, 0 nothing. Signal at close of bar i. -----
 function stSignals(key, D, seed) {
   const n = D.n, sig = new Int8Array(n);
   const c = D.c, o = D.o, h = D.h, l = D.l;
   let st = null, rngSeed = seed;
-  const rnd = function () { rngSeed = (rngSeed * 1103515245 + 12345) & 0x7fffffff; return rngSeed / 0x7fffffff; };
+  const rnd = function () { rngSeed = (rngSeed + 0x6D2B79F5) | 0; let t = Math.imul(rngSeed ^ (rngSeed >>> 15), 1 | rngSeed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
   let res = NaN, sup = NaN;
   let aDay = null, aHi = -Infinity, aLo = Infinity, aFiredUp = false, aFiredDn = false;
   for (let i = ST_WARM; i < n; i++) {
@@ -292,277 +502,41 @@ function runStrategyTest() {
   });
 }
 
-function sendLong(text) {
-  if (text.length <= 3800) return sendTelegram(text);
-  const lines = text.split('\n');
-  let chunk = '', chain = Promise.resolve();
-  lines.forEach(function (ln) {
-    if ((chunk + '\n' + ln).length > 3800) { const c = chunk; chain = chain.then(function () { return sendTelegram(c); }); chunk = ln; }
-    else chunk = chunk ? chunk + '\n' + ln : ln;
-  });
-  return chain.then(function () { return sendTelegram(chunk); });
+// ---------- Volatile-market mode ----------
+// "Volatile" = the hourly ATR is more than VOL_MULT times its average over the last 100 hours.
+// /volatiletest checks, on history, whether trading only in those conditions helps.
+// /volatile on makes the Capital.com demo trades wait for volatile conditions (off by default).
+let volatileMode = process.env.VOLATILE_MODE === 'on';
+const VOL_MULT = Number(process.env.VOL_MULT || 1.5);
+let volRunning = false;
+const volStats = { n: 0, sum: 0, w: 0 };
+
+function stIsVol(D, i, mult) {
+  let sum = 0, cnt = 0;
+  for (let k = Math.max(0, i - 100); k <= i; k++) { if (D.atr[k] > 0) { sum += D.atr[k]; cnt++; } }
+  const avg = cnt ? sum / cnt : D.atr[i];
+  return D.atr[i] > mult * avg;
 }
 
-function handleTelegramCommand(text) {
-  const parts = String(text).trim().toLowerCase().split(/\s+/);
-  const cmd = parts[0].split('@')[0];
-  const arg = parts[1] || '';
-
-  if (cmd === '/start') {
-    if (botRunning) return sendTelegram('⚠️ Already running\\. Use /status');
-    startBot(true);
-    return Promise.resolve();
-  }
-  if (cmd === '/stop') {
-    stopBot();
-    return sendTelegram('⏸️ Stopped\\. ' + md(signalCount) + ' signals · ' + md(dailyWins) + 'W/' + md(dailyLosses) + 'L');
-  }
-  if (cmd === '/status') {
-    const s = getSession();
-    return sendTelegram(
-      '📊 *Status*\n\n' +
-      'Bot: ' + (botRunning ? '🟢 Running' : '🔴 Stopped') + '\n' +
-      'Auto\\-trading: ' + (autoTrade ? '🤖 ON' : '✋ OFF') + '\n' +
-      'Broker: ' + md(tradeBroker) + '\n' +
-      (circuitOpen ? '🛑 Paused: ' + md(circuitReason) + '\n' : '') +
-      'Open trades: ' + md(pendingTrades.length) + '\n' +
-      'Signals: ' + md(signalCount) + '\n' +
-      'Wins: ' + md(dailyWins) + ' · Losses: ' + md(dailyLosses) + '\n' +
-      s.emoji + ' ' + md(s.message) + '\n' +
-      'Time: ' + md(lusakaTime()) + ' CAT'
-    );
-  }
-  if (cmd === '/auto') {
-    if (arg === 'on') { autoTrade = true; return sendTelegram('🤖 Auto\\-trading *ON* \\(' + md(isDemoAccount() ? 'demo' : 'REAL account') + '\\)'); }
-    if (arg === 'off') { autoTrade = false; return sendTelegram('✋ Auto\\-trading *OFF*\\. Manual signals only\\.'); }
-    return sendTelegram('Use /auto on or /auto off');
-  }
-  if (cmd === '/deeptest') {
-    if (deepRunning) return sendTelegram('⏳ Deep test is already running\\.');
-    deepRunning = true;
-    return sendTelegram('⏳ Deep test started\\. It takes about 5 to 8 minutes\\. I will message you when done\\.').then(function () {
-      return runDeepTest();
-    }).then(function (txt) {
-      deepRunning = false;
-      return sendTelegram(txt);
-    }).catch(function (e) {
-      deepRunning = false;
-      return sendTelegram('❌ Deep test failed: ' + md(e.message));
-    });
-  }
-  if (cmd === '/backtest') {
-    if (backtesting) return sendTelegram('⏳ Backtest is already running\\.');
-    backtesting = true;
-    return sendTelegram('⏳ Backtest started\\. This takes about a minute\\.').then(function () {
-      return runBacktest();
-    }).then(function (txt) {
-      backtesting = false;
-      return sendTelegram(txt);
-    }).catch(function (e) {
-      backtesting = false;
-      return sendTelegram('❌ Backtest failed: ' + md(e.message));
-    });
-  }
-  if (cmd === '/resume') {
-    circuitOpen = false; circuitNotified = false; consecLosses = 0; dayPnl = 0;
-    return sendTelegram('▶️ Auto\\-trading resumed\\.');
-  }
-  if (cmd === '/limit') {
-    const n = parseInt(arg, 10);
-    if (!(n >= 1 && n <= 200)) return sendTelegram('🛑 Daily limit: ' + md(maxTradesPerDay) + ' trades \(' + md(tradesToday) + ' today\)\nUse /limit 40');
-    maxTradesPerDay = n;
-    limitNotifiedDay = '';
-    return sendTelegram('🛑 Daily limit set to *' + md(n) + ' trades*\.');
-  }
-  if (cmd === '/duration') {
-    const m = parseInt(arg, 10);
-    if ([1, 2, 3, 5, 10, 15, 30].indexOf(m) === -1) {
-      return sendTelegram('⏱ Trade length: ' + md(durationMin) + ' min\nUse /duration 1, 2, 3, 5, 10, 15 or 30');
+// Live check for one Capital.com market
+function volatileNow(symbol) {
+  return capEpic(symbol).then(function (epic) {
+    return capCall('GET', '/prices/' + epic + '?resolution=HOUR&max=130');
+  }).then(function (j) {
+    const p = j.prices || [];
+    const mid = function (o) { return (Number(o.bid) + Number(o.ask)) / 2; };
+    if (p.length < 120) return { ok: false, ratio: 0 };
+    const tr = [];
+    for (let i = 1; i < p.length; i++) {
+      const h = mid(p[i].highPrice), l = mid(p[i].lowPrice), pc = mid(p[i - 1].closePrice);
+      tr.push(Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc)));
     }
-    durationMin = m;
-    return sendTelegram('⏱ Trade length set to *' + md(m) + ' min*\. Resets to ' + md(process.env.DURATION_MIN || 15) + ' min if Render restarts\.');
-  }
-  if (cmd === '/newstrade') {
-    if (arg === 'on' || arg === 'off') newsTrade = arg === 'on';
-    return sendTelegram(md(ntReport()) + '\n\nUse /newstrade on or off\\.');
-  }
-  if (cmd === '/news') {
-    if (arg === 'on' || arg === 'off') {
-      newsOn = arg === 'on';
-      return (newsOn ? loadNews() : Promise.resolve()).then(function () {
-        return sendTelegram('📰 News filter *' + md(arg.toUpperCase()) + '*');
-      });
-    }
-    return ensureNews().then(function () { return sendTelegram(md(newsReport())); });
-  }
-  if (cmd === '/strategytest') {
-    if (stratRunning) return sendTelegram('⏳ Strategy test is already running\\.');
-    stratRunning = true;
-    return sendTelegram('⏳ Strategy test started: 16 modules on hourly Capital\\.com candles\\. It takes about 3 to 6 minutes\\. I will message you when it is done\\.').then(function () {
-      return runStrategyTest();
-    }).then(function (res) {
-      stratRunning = false;
-      return res.msgs.reduce(function (chain, m) { return chain.then(function () { return sendLong(m); }); }, Promise.resolve()).then(function () { return stSendCsv(res.rows); });
-    }).catch(function (e) {
-      stratRunning = false;
-      return sendTelegram('❌ Strategy test failed: ' + md(e.message));
-    });
-  }
-  if (cmd === '/capital') {
-    return capitalDiag().then(function (t) { return sendTelegram(md(t)); })
-      .catch(function (e) { return sendTelegram('❌ ' + md(e.message)); });
-  }
-  if (cmd === '/broker') {
-    if (arg === 'capital' || arg === 'deriv' || arg === 'both') {
-      if (arg !== 'deriv' && !CAP_ON) return sendTelegram('❌ Capital\\.com keys are missing in Render\\.');
-      tradeBroker = arg;
-      return sendTelegram('🔀 Trading broker: *' + md(arg) + '*' + (arg === 'capital' ? md(' (Capital demo: forex, metals, indices, oil, crypto)') : arg === 'both' ? md(' (Capital demo for forex, metals, indices, oil, crypto + Deriv for volatility indices)') : md(' (Deriv, all its markets)')) + '\\. Resets if Render restarts unless TRADE_BROKER is set\\.');
-    }
-    return sendTelegram('Broker now: ' + md(tradeBroker) + '\nUse /broker capital, /broker deriv or /broker both');
-  }
-  if (cmd === '/risk') {
-    const v = Number(arg);
-    if (!(v >= 0.5 && v <= 50)) return sendTelegram('💵 Capital risk per trade: $' + md(capRisk) + '\nUse /risk 3 \\(between 0\\.5 and 50\\)');
-    capRisk = v;
-    return sendTelegram('💵 Risk per trade set to *$' + md(v) + '*');
-  }
-  if (cmd === '/learn') {
-    return learn().then(function () {
-      return sendTelegram('🧠 *Learning*\n\n' + md(lastLearnInfo) + '\n\nStorage: ' + md(DB_ON ? 'Supabase' : 'memory only'));
-    });
-  }
-  if (cmd === '/win') { dailyWins++; return sendTelegram('✅ Win recorded: ' + md(dailyWins) + 'W/' + md(dailyLosses) + 'L'); }
-  if (cmd === '/loss') { dailyLosses++; return sendTelegram('❌ Loss recorded: ' + md(dailyWins) + 'W/' + md(dailyLosses) + 'L'); }
-  if (cmd === '/balance') {
-    return derivBalance()
-      .then(function (b) { return sendTelegram('💰 Balance: ' + md(b)); })
-      .catch(function (e) { return sendTelegram('❌ ' + md(e.message)); });
-  }
-  if (cmd === '/accounts') {
-    return listAccounts()
-      .then(function (j) { return sendTelegram('🧾 ' + md(JSON.stringify(j).slice(0, 900))); })
-      .catch(function (e) { return sendTelegram('❌ ' + md(e.message.slice(0, 600))); });
-  }
-  return Promise.resolve();
+    const atrAt = function (end) { let s = 0; for (let k = end - 13; k <= end; k++) s += tr[k]; return s / 14; };
+    const now = atrAt(tr.length - 1);
+    let s2 = 0, c2 = 0;
+    for (let e = tr.length - 100; e < tr.length; e++) { s2 += atrAt(e); c2++; }
+    const ratio = now / (s2 / c2);
+    return { ok: ratio > VOL_MULT, ratio: ratio };
+  });
 }
 
-// ---------- HTTP ----------
-
-function send(res, code, obj) {
-  res.writeHead(code, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify(obj));
-}
-
-const server = http.createServer(function (req, res) {
-  // Keep-alive ping (no secret needed). Point a free pinger here every 10 minutes.
-  if (req.method === 'GET') {
-    send(res, 200, { ok: true, running: botRunning, time: new Date().toISOString() });
-    return;
-  }
-
-  let body = '';
-  req.on('data', function (c) { body += c; });
-  req.on('end', function () {
-    let p;
-    try { p = JSON.parse(body); }
-    catch (e) { send(res, 400, { ok: false, error: 'Invalid JSON' }); return; }
-
-    // Telegram webhook: only your own chat is allowed
-    if (req.url && req.url.indexOf('/telegram') === 0) {
-      const m = p.message;
-      send(res, 200, { ok: true });
-      if (m && m.text && m.chat && String(m.chat.id) === String(TELEGRAM_CHAT_ID)) {
-        handleTelegramCommand(m.text).catch(function (e) { console.error('Command error: ' + e.message); });
-      }
-      return;
-    }
-
-    // Everything else needs the bridge secret
-    if (req.headers['x-bridge-secret'] !== BRIDGE_SECRET) {
-      send(res, 401, { ok: false, error: 'Unauthorized' });
-      return;
-    }
-
-    console.log('[' + new Date().toISOString() + '] ' + p.cmd + ' ' + (p.symbol || ''));
-
-    if (p.cmd === 'ANALYZE') {
-      const derivSym = SYMBOL_MAP[p.symbol];
-      if (!derivSym) { send(res, 400, { ok: false, error: 'Unknown symbol' }); return; }
-      fetchCandles(derivSym, 80).then(function (prices) {
-        send(res, 200, { ok: true, symbol: p.symbol, analysis: analyze(prices) });
-      }).catch(function (err) {
-        send(res, 200, { ok: false, symbol: p.symbol, error: err.message });
-      });
-      return;
-    }
-
-    if (p.cmd === 'ACCOUNTS') {
-      listAccounts().then(function (j) { send(res, 200, { ok: true, accounts: j }); })
-        .catch(function (err) { send(res, 200, { ok: false, error: err.message }); });
-      return;
-    }
-
-    if (p.cmd === 'BALANCE') {
-      derivBalance().then(function (b) { send(res, 200, { ok: true, balance: b }); })
-        .catch(function (err) { send(res, 200, { ok: false, error: err.message }); });
-      return;
-    }
-
-    if (p.cmd === 'BUY') {
-      placeTrade(p.symbol, p.action, p.stake).then(function (t) { send(res, 200, { ok: true, trade: t }); })
-        .catch(function (err) { send(res, 200, { ok: false, error: err.message }); });
-      return;
-    }
-
-    if (p.cmd === 'CHECK') {
-      checkContract(p.contract_id).then(function (r) { send(res, 200, { ok: true, result: r }); })
-        .catch(function (err) { send(res, 200, { ok: false, error: err.message }); });
-      return;
-    }
-
-    // Dashboard controls
-    if (p.cmd === 'BOT_STATUS') { send(res, 200, Object.assign({ ok: true }, botStatus())); return; }
-    if (p.cmd === 'BOT_START') {
-      const started = startBot(true);
-      send(res, 200, { ok: true, success: started, message: started ? 'Started' : 'Already running' });
-      return;
-    }
-    if (p.cmd === 'BOT_STOP') {
-      const stopped = stopBot();
-      if (stopped) sendTelegram('⏸️ Stopped\\. ' + md(signalCount) + ' signals · ' + md(dailyWins) + 'W/' + md(dailyLosses) + 'L');
-      send(res, 200, { ok: true, success: stopped, signalCount: signalCount, dailyWins: dailyWins, dailyLosses: dailyLosses });
-      return;
-    }
-    if (p.cmd === 'BOT_TEST') {
-      const pair = availablePairs()[0] || PAIRS[0];
-      analyseSymbol(pair.symbol).then(function (a) {
-        if (!a) { send(res, 200, { ok: false, error: 'Deriv feed unreachable' }); return null; }
-        return sendTelegram(
-          '🔔 *Test — ' + md(pair.display) + '*\n\n' +
-          'Action: *' + md(a.action) + '*\n' +
-          'Price: ' + md(a.price.toFixed(pair.decimals)) + '\n' +
-          'RSI: ' + md(a.rsi.toFixed(1)) + '\n' +
-          'Reason: ' + md(a.reason) + '\n\n' +
-          '✅ Live Deriv feed working\\!'
-        ).then(function (ok) {
-          send(res, 200, { ok: true, success: ok, signal: { symbol: pair.display, action: a.action, rsi: a.rsi } });
-        });
-      });
-      return;
-    }
-
-    send(res, 400, { ok: false, error: 'Unknown command: ' + p.cmd });
-  });
-});
-
-server.listen(PORT, function () {
-  console.log('ForexPulse Bridge on port ' + PORT);
-  console.log('App ID set: ' + (DERIV_APP_ID ? 'yes' : 'NO') + ' | Token set: ' + (DERIV_API_TOKEN ? 'yes' : 'NO') +
-    ' | Telegram set: ' + (TELEGRAM_TOKEN && TELEGRAM_CHAT_ID ? 'yes' : 'NO') +
-    ' | Auto-trade: ' + autoTrade + ' | Demo account: ' + isDemoAccount());
-  // Restart-proof: Render restarts the server now and then, so resume by itself
-  console.log('Trade log: ' + (DB_ON ? 'Supabase' : 'memory only (set SUPABASE_URL and SUPABASE_KEY)'));
-  learn().then(function () {
-    if (process.env.BOT_AUTOSTART === 'true') startBot(true);
-  });
-});
