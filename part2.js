@@ -1,3 +1,91 @@
+// Recent 1-minute closes from Capital.com, for the signal analysis
+function capCloses(epic) {
+  return capCall('GET', '/prices/' + epic + '?resolution=MINUTE&max=100').then(function (j) {
+    return (j.prices || []).map(function (x) { return (Number(x.closePrice.bid) + Number(x.closePrice.ask)) / 2; });
+  });
+}
+
+let capTokens = null;      // { cst, sec, at }
+let capLastLogin = 0;
+
+function capLogin() {
+  if (!CAP_ON) return Promise.reject(new Error('Capital.com is not set up. Add CAPITAL_API_KEY, CAPITAL_API_PASSWORD, CAPITAL_EMAIL in Render.'));
+  const wait = Math.max(0, 1200 - (Date.now() - capLastLogin));   // limit: 1 login per second
+  return new Promise(function (r) { setTimeout(r, wait); }).then(function () {
+    capLastLogin = Date.now();
+    return fetch(CAP_BASE + '/session', {
+      method: 'POST',
+      headers: { 'X-CAP-API-KEY': CAP_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ identifier: CAP_EMAIL, password: CAP_PASS, encryptedPassword: false }),
+    });
+  }).then(function (r) {
+    if (!r.ok) {
+      return r.text().then(function (t) { throw new Error('Capital login ' + r.status + ': ' + t.slice(0, 160)); });
+    }
+    const cst = r.headers.get('cst');
+    const sec = r.headers.get('x-security-token');
+    if (!cst || !sec) throw new Error('Capital login gave no session tokens');
+    capTokens = { cst: cst, sec: sec, at: Date.now() };
+    return r.json().catch(function () { return {}; });
+  });
+}
+
+let capLoginP = null;
+function capEnsure() {
+  if (capTokens && Date.now() - capTokens.at < 8 * 60 * 1000) return Promise.resolve();
+  if (!capLoginP) {
+    capLoginP = capLogin().then(function () { capLoginP = null; }, function (e) { capLoginP = null; throw e; });
+  }
+  return capLoginP;
+}
+
+// method, path like '/positions', optional JSON body
+function capCall(method, path, body, retried) {
+  return capEnsure().then(function () { return capThrottle(); }).then(function () {
+    const opt = {
+      method: method,
+      headers: { 'X-SECURITY-TOKEN': capTokens.sec, CST: capTokens.cst, 'Content-Type': 'application/json' },
+    };
+    if (body) opt.body = JSON.stringify(body);
+    return fetch(CAP_BASE + path, opt);
+  }).then(function (r) {
+    if (r.status === 401 && !retried) { capTokens = null; return capCall(method, path, body, true); }
+    return r.text().then(function (t) {
+      let j = {};
+      try { j = JSON.parse(t); } catch (e) { j = { raw: t }; }
+      if (!r.ok) {
+        const err = new Error('Capital ' + r.status + ': ' + (j.errorCode || j.raw || t).toString().slice(0, 160));
+        err.status = r.status;
+        throw err;
+      }
+      return j;
+    });
+  });
+}
+
+function capBalance() {
+  return capCall('GET', '/accounts').then(function (j) {
+    const a = (j.accounts || []).filter(function (x) { return x.preferred; })[0] || (j.accounts || [])[0];
+    if (!a) throw new Error('No Capital.com account found');
+    return a;
+  });
+}
+
+function capAtr(epic) {
+  return capCall('GET', '/prices/' + epic + '?resolution=MINUTE&max=30').then(function (j) {
+    const p = j.prices || [];
+    const mid = function (o) { return (Number(o.bid) + Number(o.ask)) / 2; };
+    if (p.length < 16) throw new Error('Not enough price data for ' + epic);
+    let sum = 0, n = 0;
+    for (let i = p.length - 14; i < p.length; i++) {
+      const h = mid(p[i].highPrice), l = mid(p[i].lowPrice), pc = mid(p[i - 1].closePrice);
+      sum += Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc));
+      n++;
+    }
+    return sum / n;
+  });
+}
+
 // Open a demo position with stop loss and take profit
 function capitalTrade(symbol, action, opts) {
   return capEpic(symbol).then(function (epic) { return capitalTradeEpic(epic, action, opts); });
@@ -84,6 +172,7 @@ function checkCapitalTrades() {
           if (t.newsTitle) newsLearn(t, profit);
           if (t.volTrade) volLearn(t, profit);
           if (t.evoId) evoLearn(t, profit);
+          if (t.smcId) smcLearn(t, profit);
           pendingTrades.splice(pendingTrades.indexOf(t), 1);
           const closedAt = new Date().toISOString();
           memLog.unshift({
@@ -398,200 +487,4 @@ let newsLoadedAt = 0;
 let newsLastTry = 0;
 let newsStatus = 'not loaded yet';
 const newsNotified = {};
-
-function loadNews() {
-  newsLastTry = Date.now();
-  return fetch(NEWS_URL, { headers: { 'User-Agent': 'Mozilla/5.0 ForexPulse' } }).then(function (r) {
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    return r.json();
-  }).then(function (list) {
-    if (!Array.isArray(list)) throw new Error('unexpected format');
-    const want = NEWS_IMPACT === 'medium' ? ['high', 'medium'] : ['high'];
-    newsEvents = list.filter(function (e) {
-      return e && want.indexOf(String(e.impact || '').toLowerCase()) >= 0 && !isNaN(Date.parse(e.date));
-    }).map(function (e) {
-      return { t: Date.parse(e.date), ccy: String(e.country || '').toUpperCase(), title: String(e.title || ''), impact: String(e.impact || '') };
-    }).sort(function (a, b) { return a.t - b.t; });
-    newsLoadedAt = Date.now();
-    newsStatus = 'loaded ' + newsEvents.length + ' events';
-    console.log('News calendar: ' + newsStatus);
-  }).catch(function (e) {
-    newsStatus = 'could not load (' + e.message + '), trading without news filter';
-    console.error('News calendar: ' + newsStatus);
-  });
-}
-
-function ensureNews() {
-  if (!newsOn) return Promise.resolve();
-  const age = Date.now() - newsLoadedAt;
-  const sinceTry = Date.now() - newsLastTry;
-  if ((newsLoadedAt === 0 || age > 6 * 3600 * 1000) && sinceTry > 30 * 60 * 1000) return loadNews();
-  return Promise.resolve();
-}
-
-// returns the news event that blocks this market right now, or null
-function newsBlock(symbol) {
-  if (!newsOn) return null;
-  const ccys = NEWS_CCY[symbol];
-  if (!ccys) return null;
-  const now = Date.now();
-  for (let i = 0; i < newsEvents.length; i++) {
-    const e = newsEvents[i];
-    if (ccys.indexOf(e.ccy) < 0) continue;
-    if (now >= e.t - NEWS_BEFORE_MIN * 60000 && now <= e.t + NEWS_AFTER_MIN * 60000) return e;
-  }
-  return null;
-}
-
-function lusakaStamp(ms) {
-  return new Date(ms).toLocaleString('en-GB', {
-    timeZone: 'Africa/Lusaka', weekday: 'short', hour: '2-digit', minute: '2-digit', hour12: false,
-  });
-}
-
-function newsReport() {
-  const now = Date.now();
-  const next = newsEvents.filter(function (e) { return e.t + NEWS_AFTER_MIN * 60000 >= now; }).slice(0, 8);
-  const lines = [
-    '📰 News filter: ' + (newsOn ? 'ON' : 'OFF'),
-    'Rule: no new trades from ' + NEWS_BEFORE_MIN + ' min before to ' + NEWS_AFTER_MIN + ' min after ' + NEWS_IMPACT + '-impact news',
-    'Calendar: ' + newsStatus,
-  ];
-  if (next.length) {
-    lines.push('', 'Coming up (Zambia time):');
-    next.forEach(function (e) { lines.push(lusakaStamp(e.t) + '  ' + e.ccy + '  ' + e.title); });
-  } else if (newsLoadedAt) {
-    lines.push('', 'No more ' + NEWS_IMPACT + '-impact news this week.');
-  }
-  return lines.join('\n');
-}
-
-// ---------- News trading (Capital.com demo) ----------
-// After a high-impact release, wait a few minutes, then trade in the direction the
-// price moved if the move is big and still holding. Stop loss and take profit are
-// the same as other Capital trades. Experimental: there is no proof this has an edge.
-let newsTrade = process.env.NEWS_TRADE !== 'off';
-const NT_WAIT_MIN = Number(process.env.NT_WAIT_MIN || 3);       // wait after the release
-const NT_WINDOW_MIN = Number(process.env.NT_WINDOW_MIN || 20);  // stop looking after this
-const NT_MARKETS = { USD: ['EURUSD', 'GOLD'], EUR: ['EURUSD'], GBP: ['GBPUSD'], JPY: ['USDJPY'], AUD: ['AUDUSD'], CAD: ['USDCAD'] };
-const newsTraded = {};
-let ntMinAtr = Number(process.env.NT_MIN_ATR || 2);
-const ntStats = {};        // event title -> { n, sum, since }
-let ntAll = { n: 0, sum: 0 };
-const NT_AVOID_AFTER = 5;  // trades before an event type can be avoided
-const NT_COOLDOWN_MS = 7 * 24 * 3600 * 1000;
-
-function ntAvoid(title) {
-  const s = ntStats[title];
-  if (!s || s.n < NT_AVOID_AFTER || s.sum >= 0) return false;
-  if (Date.now() - s.last > NT_COOLDOWN_MS) { ntStats[title] = { n: 0, sum: 0, last: Date.now() }; return false; }   // try again after a week
-  return true;
-}
-
-// Called when a news trade closes: learn, but slowly (small samples are noise)
-function newsLearn(t, profit) {
-  const s = ntStats[t.newsTitle] || (ntStats[t.newsTitle] = { n: 0, sum: 0, last: 0 });
-  s.n++; s.sum += profit; s.last = Date.now();
-  ntAll.n++; ntAll.sum += profit;
-  const msgs = [];
-  if (s.n === NT_AVOID_AFTER && s.sum < 0) msgs.push('Stopped trading "' + t.newsTitle + '": ' + s.n + ' trades, net $' + s.sum.toFixed(2) + '. Will retry in a week.');
-  if (ntAll.n % 10 === 0) {
-    if (ntAll.sum < 0 && ntMinAtr < 4) { ntMinAtr += 0.5; msgs.push('Last 10 news trades lost overall, so I now ask for a bigger move: ' + ntMinAtr + 'x.'); }
-    ntAll = { n: 0, sum: 0 };
-  }
-  if (msgs.length) sendTelegram('🧠 *News learning*\n' + md(msgs.join('\n')));
-}
-
-function ntReport() {
-  const lines = ['📰 News trading: ' + (newsTrade ? 'ON' : 'OFF') + ' · needs a move of ' + ntMinAtr + 'x normal', ''];
-  const keys = Object.keys(ntStats);
-  if (!keys.length) lines.push('No news trades closed yet.');
-  keys.forEach(function (k) {
-    const s = ntStats[k];
-    lines.push(k + ': ' + s.n + ' trades, net $' + s.sum.toFixed(2) + (ntAvoid(k) ? ' (avoiding)' : ''));
-  });
-  return lines.join('\n');
-}
-
-function newsMove(epic, eventT) {
-  return capCall('GET', '/prices/' + epic + '?resolution=MINUTE&max=60').then(function (j) {
-    const p = j.prices || [];
-    const mid = function (o) { return (Number(o.bid) + Number(o.ask)) / 2; };
-    const ts = function (x) { return Date.parse((x.snapshotTimeUTC || x.snapshotTime) + 'Z'); };
-    let i0 = -1;
-    for (let i = 0; i < p.length; i++) { if (ts(p[i]) >= eventT - 60000) { i0 = i; break; } }
-    if (i0 < 15 || i0 >= p.length - 1) return null;
-    let sum = 0;
-    for (let i = i0 - 14; i < i0; i++) sum += mid(p[i].highPrice) - mid(p[i].lowPrice);
-    const atr = sum / 14;
-    const start = mid(p[i0].openPrice);
-    const last = p[p.length - 1];
-    const now = mid(last.closePrice);
-    const move = now - start;
-    let hi = -Infinity, lo = Infinity;
-    for (let i = i0; i < p.length; i++) { hi = Math.max(hi, mid(p[i].highPrice)); lo = Math.min(lo, mid(p[i].lowPrice)); }
-    return { atr: atr, move: move, now: now, hi: hi, lo: lo, start: start };
-  });
-}
-
-function maybeNewsTrade() {
-  if (!newsTrade || !newsOn || !autoTrade || !CAP_ON || tradeBroker === 'deriv' || circuitOpen) return Promise.resolve();
-  const now = Date.now();
-  const due = newsEvents.filter(function (e) {
-    return now >= e.t + NT_WAIT_MIN * 60000 && now <= e.t + NT_WINDOW_MIN * 60000 && NT_MARKETS[e.ccy];
-  });
-  return due.reduce(function (chain, e) {
-    return NT_MARKETS[e.ccy].reduce(function (c2, sym) {
-      const key = e.t + e.ccy + e.title + sym;
-      if (newsTraded[key]) return c2;
-      return c2.then(function () {
-        const pair = PAIRS.filter(function (p) { return p.symbol === sym; })[0];
-        if (!pair) return null;
-        if (pendingTrades.some(function (t) { return t.display === pair.display; })) return null;
-        if (pendingTrades.length >= 6) return null;
-        if (ntAvoid(e.title)) return null;
-        newsTraded[key] = true;   // one try per event and market
-        return capEpic(sym).then(function (epic) { return newsMove(epic, e.t); }).then(function (m) {
-          if (!m || !(m.atr > 0)) return null;
-          const size = Math.abs(m.move);
-          if (size < ntMinAtr * m.atr) {
-            console.log('News trade skip ' + sym + ': move too small');
-            return null;
-          }
-          const action = m.move > 0 ? 'BUY' : 'SELL';
-          // still holding: price must be in the outer 40% of the range since the release
-          const rng = m.hi - m.lo;
-          const pos = rng > 0 ? (m.now - m.lo) / rng : 0.5;
-          if ((action === 'BUY' && pos < 0.6) || (action === 'SELL' && pos > 0.4)) {
-            console.log('News trade skip ' + sym + ': move already fading');
-            return null;
-          }
-          return capitalTrade(sym, action).then(function (t) {
-            tradesToday++;
-            pendingTrades.push({
-              contractId: t.dealId, display: pair.display, symbol: sym, action: action,
-              placedAt: Date.now(), votes: { news: action === 'BUY' ? 1 : -1 }, minutes: CAP_MAX_HOLD_MIN, broker: 'capital', newsTitle: e.title,
-            });
-            dbInsertTrade({
-              contract_id: String(t.dealId), symbol: sym, action: action, confidence: 0,
-              votes: { news: action === 'BUY' ? 1 : -1 }, rsi: 0, hour: lusakaHour(),
-              stake: Number(t.riskUsd.toFixed(2)), demo: true,
-            });
-            return sendTelegram(
-              '📰 *NEWS TRADE — ' + md(pair.display) + '* \\(Capital demo\\)\n\n' +
-              md(e.ccy + ' ' + e.title) + '\n' +
-              md(action) + ' · moved ' + md((size / m.atr).toFixed(1)) + 'x normal since the release\n' +
-              'Size ' + md(t.size) + ' · risk about $' + md(t.riskUsd.toFixed(2)) + '\n' +
-              'Stop loss: ' + md(t.sl.toPrecision(4)) + ' away · Take profit: ' + md(t.tp.toPrecision(4)) + ' away\n' +
-              '\nExperimental, no proven edge\\.'
-            );
-          });
-        }).catch(function (err) {
-          console.log('News trade ' + sym + ': ' + err.message);
-          return null;
-        });
-      });
-    }, chain);
-  }, Promise.resolve());
-}
 
