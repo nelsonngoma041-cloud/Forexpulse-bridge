@@ -3,6 +3,6 @@
 const fs = require('fs');
 const path = require('path');
 let code = '';
-for (let i = 1; i <= 4; i++) code += fs.readFileSync(path.join(__dirname, 'part' + i + '.js'), 'utf8') + '\n';
+for (let i = 1; i <= 6; i++) code += fs.readFileSync(path.join(__dirname, 'part' + i + '.js'), 'utf8') + '\n';
 const run = new Function('require', 'process', 'console', 'module', code);
 run(require, process, console, module);
