@@ -1,3 +1,199 @@
+function loadNews() {
+  newsLastTry = Date.now();
+  return fetch(NEWS_URL, { headers: { 'User-Agent': 'Mozilla/5.0 ForexPulse' } }).then(function (r) {
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.json();
+  }).then(function (list) {
+    if (!Array.isArray(list)) throw new Error('unexpected format');
+    const want = NEWS_IMPACT === 'medium' ? ['high', 'medium'] : ['high'];
+    newsEvents = list.filter(function (e) {
+      return e && want.indexOf(String(e.impact || '').toLowerCase()) >= 0 && !isNaN(Date.parse(e.date));
+    }).map(function (e) {
+      return { t: Date.parse(e.date), ccy: String(e.country || '').toUpperCase(), title: String(e.title || ''), impact: String(e.impact || '') };
+    }).sort(function (a, b) { return a.t - b.t; });
+    newsLoadedAt = Date.now();
+    newsStatus = 'loaded ' + newsEvents.length + ' events';
+    console.log('News calendar: ' + newsStatus);
+  }).catch(function (e) {
+    newsStatus = 'could not load (' + e.message + '), trading without news filter';
+    console.error('News calendar: ' + newsStatus);
+  });
+}
+
+function ensureNews() {
+  if (!newsOn) return Promise.resolve();
+  const age = Date.now() - newsLoadedAt;
+  const sinceTry = Date.now() - newsLastTry;
+  if ((newsLoadedAt === 0 || age > 6 * 3600 * 1000) && sinceTry > 30 * 60 * 1000) return loadNews();
+  return Promise.resolve();
+}
+
+// returns the news event that blocks this market right now, or null
+function newsBlock(symbol) {
+  if (!newsOn) return null;
+  const ccys = NEWS_CCY[symbol];
+  if (!ccys) return null;
+  const now = Date.now();
+  for (let i = 0; i < newsEvents.length; i++) {
+    const e = newsEvents[i];
+    if (ccys.indexOf(e.ccy) < 0) continue;
+    if (now >= e.t - NEWS_BEFORE_MIN * 60000 && now <= e.t + NEWS_AFTER_MIN * 60000) return e;
+  }
+  return null;
+}
+
+function lusakaStamp(ms) {
+  return new Date(ms).toLocaleString('en-GB', {
+    timeZone: 'Africa/Lusaka', weekday: 'short', hour: '2-digit', minute: '2-digit', hour12: false,
+  });
+}
+
+function newsReport() {
+  const now = Date.now();
+  const next = newsEvents.filter(function (e) { return e.t + NEWS_AFTER_MIN * 60000 >= now; }).slice(0, 8);
+  const lines = [
+    '📰 News filter: ' + (newsOn ? 'ON' : 'OFF'),
+    'Rule: no new trades from ' + NEWS_BEFORE_MIN + ' min before to ' + NEWS_AFTER_MIN + ' min after ' + NEWS_IMPACT + '-impact news',
+    'Calendar: ' + newsStatus,
+  ];
+  if (next.length) {
+    lines.push('', 'Coming up (Zambia time):');
+    next.forEach(function (e) { lines.push(lusakaStamp(e.t) + '  ' + e.ccy + '  ' + e.title); });
+  } else if (newsLoadedAt) {
+    lines.push('', 'No more ' + NEWS_IMPACT + '-impact news this week.');
+  }
+  return lines.join('\n');
+}
+
+// ---------- News trading (Capital.com demo) ----------
+// After a high-impact release, wait a few minutes, then trade in the direction the
+// price moved if the move is big and still holding. Stop loss and take profit are
+// the same as other Capital trades. Experimental: there is no proof this has an edge.
+let newsTrade = process.env.NEWS_TRADE !== 'off';
+const NT_WAIT_MIN = Number(process.env.NT_WAIT_MIN || 3);       // wait after the release
+const NT_WINDOW_MIN = Number(process.env.NT_WINDOW_MIN || 20);  // stop looking after this
+const NT_MARKETS = { USD: ['EURUSD', 'GOLD'], EUR: ['EURUSD'], GBP: ['GBPUSD'], JPY: ['USDJPY'], AUD: ['AUDUSD'], CAD: ['USDCAD'] };
+const newsTraded = {};
+let ntMinAtr = Number(process.env.NT_MIN_ATR || 2);
+const ntStats = {};        // event title -> { n, sum, since }
+let ntAll = { n: 0, sum: 0 };
+const NT_AVOID_AFTER = 5;  // trades before an event type can be avoided
+const NT_COOLDOWN_MS = 7 * 24 * 3600 * 1000;
+
+function ntAvoid(title) {
+  const s = ntStats[title];
+  if (!s || s.n < NT_AVOID_AFTER || s.sum >= 0) return false;
+  if (Date.now() - s.last > NT_COOLDOWN_MS) { ntStats[title] = { n: 0, sum: 0, last: Date.now() }; return false; }   // try again after a week
+  return true;
+}
+
+// Called when a news trade closes: learn, but slowly (small samples are noise)
+function newsLearn(t, profit) {
+  const s = ntStats[t.newsTitle] || (ntStats[t.newsTitle] = { n: 0, sum: 0, last: 0 });
+  s.n++; s.sum += profit; s.last = Date.now();
+  ntAll.n++; ntAll.sum += profit;
+  const msgs = [];
+  if (s.n === NT_AVOID_AFTER && s.sum < 0) msgs.push('Stopped trading "' + t.newsTitle + '": ' + s.n + ' trades, net $' + s.sum.toFixed(2) + '. Will retry in a week.');
+  if (ntAll.n % 10 === 0) {
+    if (ntAll.sum < 0 && ntMinAtr < 4) { ntMinAtr += 0.5; msgs.push('Last 10 news trades lost overall, so I now ask for a bigger move: ' + ntMinAtr + 'x.'); }
+    ntAll = { n: 0, sum: 0 };
+  }
+  if (msgs.length) sendTelegram('🧠 *News learning*\n' + md(msgs.join('\n')));
+}
+
+function ntReport() {
+  const lines = ['📰 News trading: ' + (newsTrade ? 'ON' : 'OFF') + ' · needs a move of ' + ntMinAtr + 'x normal', ''];
+  const keys = Object.keys(ntStats);
+  if (!keys.length) lines.push('No news trades closed yet.');
+  keys.forEach(function (k) {
+    const s = ntStats[k];
+    lines.push(k + ': ' + s.n + ' trades, net $' + s.sum.toFixed(2) + (ntAvoid(k) ? ' (avoiding)' : ''));
+  });
+  return lines.join('\n');
+}
+
+function newsMove(epic, eventT) {
+  return capCall('GET', '/prices/' + epic + '?resolution=MINUTE&max=60').then(function (j) {
+    const p = j.prices || [];
+    const mid = function (o) { return (Number(o.bid) + Number(o.ask)) / 2; };
+    const ts = function (x) { return Date.parse((x.snapshotTimeUTC || x.snapshotTime) + 'Z'); };
+    let i0 = -1;
+    for (let i = 0; i < p.length; i++) { if (ts(p[i]) >= eventT - 60000) { i0 = i; break; } }
+    if (i0 < 15 || i0 >= p.length - 1) return null;
+    let sum = 0;
+    for (let i = i0 - 14; i < i0; i++) sum += mid(p[i].highPrice) - mid(p[i].lowPrice);
+    const atr = sum / 14;
+    const start = mid(p[i0].openPrice);
+    const last = p[p.length - 1];
+    const now = mid(last.closePrice);
+    const move = now - start;
+    let hi = -Infinity, lo = Infinity;
+    for (let i = i0; i < p.length; i++) { hi = Math.max(hi, mid(p[i].highPrice)); lo = Math.min(lo, mid(p[i].lowPrice)); }
+    return { atr: atr, move: move, now: now, hi: hi, lo: lo, start: start };
+  });
+}
+
+function maybeNewsTrade() {
+  if (!newsTrade || !newsOn || !autoTrade || !CAP_ON || tradeBroker === 'deriv' || circuitOpen) return Promise.resolve();
+  const now = Date.now();
+  const due = newsEvents.filter(function (e) {
+    return now >= e.t + NT_WAIT_MIN * 60000 && now <= e.t + NT_WINDOW_MIN * 60000 && NT_MARKETS[e.ccy];
+  });
+  return due.reduce(function (chain, e) {
+    return NT_MARKETS[e.ccy].reduce(function (c2, sym) {
+      const key = e.t + e.ccy + e.title + sym;
+      if (newsTraded[key]) return c2;
+      return c2.then(function () {
+        const pair = PAIRS.filter(function (p) { return p.symbol === sym; })[0];
+        if (!pair) return null;
+        if (pendingTrades.some(function (t) { return t.display === pair.display; })) return null;
+        if (pendingTrades.length >= 6) return null;
+        if (ntAvoid(e.title)) return null;
+        newsTraded[key] = true;   // one try per event and market
+        return capEpic(sym).then(function (epic) { return newsMove(epic, e.t); }).then(function (m) {
+          if (!m || !(m.atr > 0)) return null;
+          const size = Math.abs(m.move);
+          if (size < ntMinAtr * m.atr) {
+            console.log('News trade skip ' + sym + ': move too small');
+            return null;
+          }
+          const action = m.move > 0 ? 'BUY' : 'SELL';
+          // still holding: price must be in the outer 40% of the range since the release
+          const rng = m.hi - m.lo;
+          const pos = rng > 0 ? (m.now - m.lo) / rng : 0.5;
+          if ((action === 'BUY' && pos < 0.6) || (action === 'SELL' && pos > 0.4)) {
+            console.log('News trade skip ' + sym + ': move already fading');
+            return null;
+          }
+          return capitalTrade(sym, action).then(function (t) {
+            tradesToday++;
+            pendingTrades.push({
+              contractId: t.dealId, display: pair.display, symbol: sym, action: action,
+              placedAt: Date.now(), votes: { news: action === 'BUY' ? 1 : -1 }, minutes: CAP_MAX_HOLD_MIN, broker: 'capital', newsTitle: e.title,
+            });
+            dbInsertTrade({
+              contract_id: String(t.dealId), symbol: sym, action: action, confidence: 0,
+              votes: { news: action === 'BUY' ? 1 : -1 }, rsi: 0, hour: lusakaHour(),
+              stake: Number(t.riskUsd.toFixed(2)), demo: true,
+            });
+            return sendTelegram(
+              '📰 *NEWS TRADE — ' + md(pair.display) + '* \\(Capital demo\\)\n\n' +
+              md(e.ccy + ' ' + e.title) + '\n' +
+              md(action) + ' · moved ' + md((size / m.atr).toFixed(1)) + 'x normal since the release\n' +
+              'Size ' + md(t.size) + ' · risk about $' + md(t.riskUsd.toFixed(2)) + '\n' +
+              'Stop loss: ' + md(t.sl.toPrecision(4)) + ' away · Take profit: ' + md(t.tp.toPrecision(4)) + ' away\n' +
+              '\nExperimental, no proven edge\\.'
+            );
+          });
+        }).catch(function (err) {
+          console.log('News trade ' + sym + ': ' + err.message);
+          return null;
+        });
+      });
+    }, chain);
+  }, Promise.resolve());
+}
+
 function dispatchSignal() {
   return ensureNews().then(dispatchSignalInner);
 }
@@ -189,6 +385,7 @@ function tick() {
     .then(dispatchSignal)
     .then(function () { return ensureNews().then(maybeNewsTrade); })
     .then(maybeEvolvedTrade)
+    .then(maybeSmcTrade)
     .catch(function (e) { console.error('Tick error: ' + e.message); })
     .then(function () { scanning = false; });
 }
@@ -296,250 +493,5 @@ function backtestFromData(data) {
     });
   });
   return out;
-}
-
-function btLine(label, s) {
-  if (!s || s.n === 0) return md(label) + ': no trades';
-  const wr = Math.round(s.w / s.n * 100);
-  const mark = s.n < 50 ? ' ⚠️' : (wr >= 55 && s.n >= 100 ? ' ✅' : '');
-  return md(label) + ': ' + md(wr) + '% \\(' + md(s.n) + ' trades\\)' + mark;
-}
-
-function btReport(res, pairCount) {
-  const lines = ['📊 *Backtest*', 'Past 1\\-min candles, ' + md(pairCount) + ' markets\\. Break\\-even is about 53%\\.', '⚠️ \\= too few trades  ✅ \\= 55%\\+ with 100\\+ trades', ''];
-  BT_LENGTHS.forEach(function (N) {
-    lines.push('*' + N + ' min trades*');
-    STRATEGIES.forEach(function (k) { lines.push(btLine(STRAT_NAMES[k], res[N].strat[k])); });
-    lines.push(btLine('Combined rule', res[N].strat.combo));
-    const best = Object.keys(res[N].pairs)
-      .filter(function (s) { return res[N].pairs[s].n >= 15; })
-      .sort(function (a, b) { return res[N].pairs[b].w / res[N].pairs[b].n - res[N].pairs[a].w / res[N].pairs[a].n; })
-      .slice(0, 3);
-    if (best.length) lines.push('Best markets: ' + best.map(function (s) { return md(s) + ' ' + md(Math.round(res[N].pairs[s].w / res[N].pairs[s].n * 100)) + '%'; }).join(', '));
-    lines.push('');
-  });
-  return lines.join('\n');
-}
-
-function fetchHistory(key, errors) {
-  const sizes = [5000, 2000, 1000];
-  const attempt = function (i) {
-    return fetchCandles(SYMBOL_MAP[key], sizes[i], 45000).then(function (p) {
-      if (p.length < 120) throw new Error('only ' + p.length + ' candles');
-      return p;
-    }).catch(function (e) {
-      errors.push(key + ' (' + sizes[i] + '): ' + e.message);
-      if (i + 1 < sizes.length) return attempt(i + 1);
-      return null;
-    });
-  };
-  return attempt(0);
-}
-
-function runBacktest() {
-  const keys = Object.keys(SYMBOL_MAP);
-  const data = {};
-  const errors = [];
-  return keys.reduce(function (chain, key) {
-    return chain.then(function () {
-      return fetchHistory(key, errors).then(function (p) { if (p) data[key] = p; });
-    });
-  }, Promise.resolve()).then(function () {
-    const got = Object.keys(data);
-    if (got.length === 0) {
-      throw new Error('No market data could be loaded. ' + (errors[0] || ''));
-    }
-    return btReport(backtestFromData(data), got.length);
-  });
-}
-
-// ---------- Deep test: months of history + stop loss / take profit ----------
-// /deeptest downloads many pages of 1-min candles, then tests
-//  (a) plain Rise/Fall wins, and (b) trades with a stop loss and take profit.
-// Results in R units: 1R = the amount risked on one trade.
-
-let deepRunning = false;
-const DEEP_PAGES = Number(process.env.DEEP_PAGES || 8);   // 5000 candles per page
-const COST_R = 0.1;        // assumed cost per trade, in R (spread / commission)
-const MAX_HOLD = 60;       // close a trade after 60 candles if no stop or target hit
-const SLTP_CONFIGS = [{ sl: 1, tp: 2, name: '1:2' }, { sl: 1, tp: 3, name: '1:3' }];
-const DEEP_STRATS = STRATEGIES.concat(['combo', 'random']);
-const DEEP_NAMES = { rsi: 'RSI', macd: 'MACD', trend: 'Trend', bands: 'Bollinger', breakout: 'Breakout', combo: 'Combined', random: 'Random' };
-const REAL_KEYS = ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCAD', 'GOLD', 'SILVER'];
-
-function fetchCandlesFull(derivSymbol, count, endEpoch) {
-  return wsRequest(PUBLIC_WS, {
-    ticks_history: derivSymbol,
-    adjust_start_time: 1,
-    count: count,
-    end: endEpoch || 'latest',
-    start: 1,
-    style: 'candles',
-    granularity: 60,
-  }, 45000).then(function (msg) {
-    return (msg.candles || []).map(function (c) {
-      return { t: Number(c.epoch), h: Number(c.high), l: Number(c.low), c: Number(c.close) };
-    });
-  });
-}
-
-// Download several pages, newest first, and join them oldest to newest
-function fetchPaged(key, pages, errors) {
-  let all = [];
-  const step = function (p, end) {
-    if (p >= pages) return Promise.resolve(all);
-    return fetchCandlesFull(SYMBOL_MAP[key], 5000, end).then(function (chunk) {
-      if (!chunk.length) return all;
-      all = chunk.concat(all);
-      return step(p + 1, chunk[0].t - 1);
-    }).catch(function (e) {
-      errors.push(key + ' page ' + (p + 1) + ': ' + e.message);
-      return all;
-    });
-  };
-  return step(0, null);
-}
-
-function atrAt(c, i) {
-  let sum = 0;
-  for (let j = i - 13; j <= i; j++) {
-    const pc = c[j - 1].c;
-    sum += Math.max(c[j].h - c[j].l, Math.abs(c[j].h - pc), Math.abs(c[j].l - pc));
-  }
-  return sum / 14;
-}
-
-// One stop loss / take profit simulation for one strategy on one market
-function simSLTP(c, voteAt, cfg, out) {
-  let i = 79;
-  while (i < c.length - 2) {
-    const v = voteAt(i);
-    if (v === 0) { i++; continue; }
-    const atr = atrAt(c, i);
-    if (!(atr > 0)) { i++; continue; }
-    const entry = c[i].c;
-    const sl = cfg.sl * atr;
-    const tp = cfg.tp * atr;
-    const last = Math.min(i + MAX_HOLD, c.length - 1);
-    let R = null;
-    let j = i + 1;
-    for (; j <= last; j++) {
-      const hitSL = v > 0 ? c[j].l <= entry - sl : c[j].h >= entry + sl;
-      const hitTP = v > 0 ? c[j].h >= entry + tp : c[j].l <= entry - tp;
-      if (hitSL) { R = -1; break; }          // if both hit in one candle, assume the stop came first
-      if (hitTP) { R = cfg.tp / cfg.sl; break; }
-    }
-    if (R === null) {
-      j = last;
-      const move = v > 0 ? c[last].c - entry : entry - c[last].c;
-      R = Math.max(-1, Math.min(cfg.tp / cfg.sl, move / sl));
-    }
-    out.n++;
-    if (R > 0) out.w++;
-    out.sumR += R - COST_R;
-    i = j + 1;
-  }
-}
-
-function emptyAgg() {
-  const a = { rf: {}, sl: {} };
-  ['real', 'synth'].forEach(function (g) {
-    a.rf[g] = {};
-    [5, 15].forEach(function (N) {
-      a.rf[g][N] = {};
-      DEEP_STRATS.forEach(function (k) { a.rf[g][N][k] = { n: 0, w: 0 }; });
-    });
-    a.sl[g] = {};
-    SLTP_CONFIGS.forEach(function (cfg) {
-      a.sl[g][cfg.name] = {};
-      DEEP_STRATS.forEach(function (k) { a.sl[g][cfg.name][k] = { n: 0, w: 0, sumR: 0 }; });
-    });
-  });
-  return a;
-}
-
-// Test one market and add its results to the totals
-function deepProcess(key, c, agg) {
-  const g = REAL_KEYS.indexOf(key) >= 0 ? 'real' : 'synth';
-  const cl = c.map(function (x) { return x.c; });
-  const votesAt = [];
-  for (let i = 79; i < cl.length; i++) votesAt[i] = getVotes(cl.slice(i - 79, i + 1)).votes;
-
-  let seed = 12345 + key.length * 977;
-  const rnd = function () { seed = (seed + 0x6D2B79F5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
-  const voteFor = function (k) {
-    if (k === 'random') return function () { return rnd() < 0.5 ? 1 : -1; };
-    if (k === 'combo') return function (i) { return comboVote(votesAt[i]); };
-    return function (i) { return votesAt[i][k]; };
-  };
-
-  DEEP_STRATS.forEach(function (k) {
-    [5, 15].forEach(function (N) {
-      const vf = voteFor(k);
-      const o = agg.rf[g][N][k];
-      let i = 79;
-      while (i < cl.length - N) {
-        const v = vf(i);
-        if (v === 0) { i++; continue; }
-        const won = (v > 0 && cl[i + N] > cl[i]) || (v < 0 && cl[i + N] < cl[i]);
-        o.n++;
-        if (won) o.w++;
-        i += N;
-      }
-    });
-    SLTP_CONFIGS.forEach(function (cfg) {
-      simSLTP(c, voteFor(k), cfg, agg.sl[g][cfg.name][k]);
-    });
-  });
-}
-
-function pct(o) { return o.n ? Math.round(o.w / o.n * 100) : 0; }
-
-function deepReport(agg, info) {
-  const GL = { real: 'Forex and metals', synth: 'Volatility indices' };
-  const L = [];
-  L.push('📊 *' + md('Deep test') + '*');
-  L.push(md(info.markets + ' markets, about ' + info.days + ' days of 1-min candles.'));
-  L.push(md('Stop-loss tests assume a cost of ' + COST_R + 'R per trade.'));
-  L.push('');
-  L.push('*' + md('Rise/Fall (break-even about 53%)') + '*');
-  ['real', 'synth'].forEach(function (g) {
-    [5, 15].forEach(function (N) {
-      const parts = DEEP_STRATS.map(function (k) {
-        const o = agg.rf[g][N][k];
-        if (!o.n) return DEEP_NAMES[k] + ' none';
-        const mark = o.n < 100 ? ' ⚠️' : (pct(o) >= 55 && o.n >= 300 ? ' ✅' : '');
-        return DEEP_NAMES[k] + ' ' + pct(o) + '% (' + o.n + ')' + mark;
-      });
-      L.push(md(GL[g] + ', ' + N + ' min: ' + parts.join(' | ')));
-    });
-  });
-  L.push('');
-  L.push('*' + md('Stop loss and take profit (average R per trade)') + '*');
-  const found = [];
-  SLTP_CONFIGS.forEach(function (cfg) {
-    ['real', 'synth'].forEach(function (g) {
-      const base = agg.sl[g][cfg.name].random;
-      const baseR = base.n ? base.sumR / base.n : 0;
-      const parts = DEEP_STRATS.map(function (k) {
-        const o = agg.sl[g][cfg.name][k];
-        if (!o.n) return DEEP_NAMES[k] + ' none';
-        const r = o.sumR / o.n;
-        const good = k !== 'random' && o.n >= 300 && r >= 0.1 && r - baseR >= 0.08;
-        if (good) found.push(DEEP_NAMES[k] + ' on ' + GL[g] + ' with ' + cfg.name + ' (' + (r >= 0 ? '+' : '') + r.toFixed(2) + 'R, ' + o.n + ' trades)');
-        return DEEP_NAMES[k] + ' ' + (r >= 0 ? '+' : '') + r.toFixed(2) + 'R ' + pct(o) + '% (' + o.n + ')' + (good ? ' ✅' : (o.n < 100 ? ' ⚠️' : ''));
-      });
-      L.push(md(GL[g] + ', stop ' + cfg.name + ': ' + parts.join(' | ')));
-    });
-  });
-  L.push('');
-  if (found.length) {
-    L.push('*' + md('Possible edge:') + '*');
-    found.slice(0, 4).forEach(function (f) { L.push(md('• ' + f)); });
-    L.push(md('Still treat this as a lead to confirm on demo, not proof.'));
-  } else {
-    L.push('*' + md('Verdict: no strategy clearly beats random entries.') + '*');
-  }
-  return L.join('\n');
 }
 
