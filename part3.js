@@ -1,3 +1,146 @@
+function dispatchSignal() {
+  return ensureNews().then(dispatchSignalInner);
+}
+
+// true if this pair is on hold for news (and tells you once per event)
+function newsHold(p) {
+  if (p.type === 'derived') return false;
+  const e = newsBlock(p.symbol);
+  if (!e) return false;
+  const key = e.t + e.ccy + e.title;
+  if (!newsNotified[key]) {
+    newsNotified[key] = true;
+    sendTelegram('📰 *News hold*: ' + md(e.ccy + ' ' + e.title) + ' at ' + md(lusakaStamp(e.t)) + '\\. No new ' + md(e.ccy) + ' trades from ' + md(NEWS_BEFORE_MIN) + ' min before to ' + md(NEWS_AFTER_MIN) + ' min after\\.');
+  }
+  return true;
+}
+
+function dispatchSignalInner() {
+  if (autoTrade && circuitOpen) {
+    const d = new Date().toISOString().slice(0, 10);
+    if (d !== pnlDay) { pnlDay = d; dayPnl = 0; consecLosses = 0; circuitOpen = false; circuitNotified = false; }
+    else return Promise.resolve();
+  }
+  // Daily limit: say it once, then stay quiet until the next day
+  if (autoTrade) {
+    const day = new Date().toISOString().slice(0, 10);
+    if (day !== tradeDay) { tradeDay = day; tradesToday = 0; }
+    if (tradesToday >= maxTradesPerDay) {
+      if (limitNotifiedDay === day) return Promise.resolve();
+      limitNotifiedDay = day;
+      return sendTelegram('🛑 Daily limit of ' + md(maxTradesPerDay) + ' trades reached\. No more trades until tomorrow \(02:00 Zambia time\)\. Use /limit 40 to raise it\.');
+    }
+  }
+  const session = getSession();
+  if (process.env.SKIP_LOW_SESSION === 'true' && session.quality === 0) return Promise.resolve();
+
+  const pairs = availablePairs().filter(function (p) {
+    return Date.now() - (lastSignalAt[p.symbol] || 0) > COOLDOWN_MS &&
+      Date.now() > (blockedUntil[p.symbol] || 0) &&
+      !(p.symbol in pausedPairs) &&
+      !newsHold(p);
+  });
+
+  return Promise.all(pairs.map(function (p) {
+    return analyseSymbol(p.symbol).then(function (a) { return { pair: p, a: a }; });
+  })).then(function (results) {
+    const valid = results.filter(function (r) {
+      return r.a && r.a.action !== 'WAIT' && r.a.confidence >= MIN_CONFIDENCE;
+    }).sort(function (x, y) { return y.a.confidence - x.a.confidence; });
+
+    if (valid.length === 0) { console.log('No clear setup this round'); return null; }
+
+    const place = function (pick) {
+    const pair = pick.pair;
+    const a = pick.a;
+    const time = lusakaTime();
+    const emoji = a.action === 'BUY' ? '🟢📈' : '🔴📉';
+    const direction = a.action === 'BUY' ? 'Rise' : 'Fall';
+    const price = a.price.toFixed(pair.decimals);
+
+    const record = function () {
+      recentSignals.unshift({
+        id: String(Date.now()), symbol: pair.display, action: a.action,
+        confidence: a.confidence, rsi: a.rsi, time: time.slice(0, 5),
+        type: pair.type, priceSource: 'live',
+      });
+      if (recentSignals.length > 20) recentSignals.pop();
+    };
+
+    // ----- Auto trade -----
+    if (autoTrade) {
+      if (pendingTrades.some(function (t) { return t.display === pair.display; })) return null;
+      if (pendingTrades.length >= (tradeBroker === 'both' ? 6 : MAX_OPEN_TRADES)) return null;
+      if (tradeBroker !== 'deriv' && pair.type !== 'derived') {
+        const gate = volatileMode ? volatileNow(pair.symbol).catch(function () { return { ok: false, ratio: 0 }; }) : Promise.resolve({ ok: true });
+        return gate.then(function (vg) {
+          if (!vg.ok) { console.log('Volatile mode: skip ' + pair.symbol + ' (ratio ' + (vg.ratio || 0).toFixed(2) + ')'); return null; }
+          return capitalTrade(pair.symbol, a.action).then(function (t) {
+          signalCount++;
+          tradesToday++;
+          lastSignalAt[pair.symbol] = Date.now();
+          pendingTrades.push({
+            contractId: t.dealId, display: pair.display, symbol: pair.symbol, action: a.action,
+            placedAt: Date.now(), votes: a.votes || {}, minutes: CAP_MAX_HOLD_MIN, broker: 'capital', volTrade: volatileMode,
+          });
+          dbInsertTrade({
+            contract_id: String(t.dealId), symbol: pair.symbol, action: a.action,
+            confidence: a.confidence, votes: a.votes || {}, rsi: a.rsi,
+            hour: lusakaHour(), stake: Number(t.riskUsd.toFixed(2)), demo: true,
+          });
+          record();
+          return sendTelegram(
+            emoji + ' *TRADE PLACED — ' + md(pair.display) + '* \\(Capital demo\\)\n\n' +
+            md(a.action) + ' · size ' + md(t.size) + ' · risk about $' + md(t.riskUsd.toFixed(2)) + '\n' +
+            'Entry: ' + md(Number(t.level).toFixed(pair.decimals)) + '\n' +
+            'Stop loss: ' + md(t.sl.toPrecision(4)) + ' away · Take profit: ' + md(t.tp.toPrecision(4)) + ' away\n' +
+            'Confidence: ' + md(a.confidence) + '% · Why: ' + md(a.reason) + '\n' +
+            '\n🤖 Auto\\-trading · ⏰ ' + md(time)
+          );
+        }).catch(function (e) {
+          if (/closed|not offered|not tradeable|not available|too big/i.test(e.message)) {
+            blockedUntil[pair.symbol] = Date.now() + 60 * 60 * 1000;
+            console.log('Capital skip ' + pair.symbol + ': ' + e.message);
+            return null;
+          }
+          lastSignalAt[pair.symbol] = Date.now();
+          return sendTelegram('⚠️ Capital trade blocked on ' + md(pair.display) + ': ' + md(e.message));
+        });
+        });
+      }
+      if (tradeBroker === 'capital') return null;
+      return placeTrade(pair.symbol, a.action, STAKE).then(function (t) {
+        signalCount++;
+        lastSignalAt[pair.symbol] = Date.now();
+        pendingTrades.push({
+          contractId: t.contract_id, display: pair.display, symbol: pair.symbol,
+          action: a.action, placedAt: Date.now(), votes: a.votes || {}, minutes: t.minutes || durationMin,
+        });
+        dbInsertTrade({
+          contract_id: String(t.contract_id), symbol: pair.symbol, action: a.action,
+          confidence: a.confidence, votes: a.votes || {}, rsi: a.rsi,
+          hour: lusakaHour(), stake: STAKE, demo: isDemoAccount(),
+        });
+        record();
+        return sendTelegram(
+          emoji + ' *TRADE PLACED — ' + md(pair.display) + '*\n\n' +
+          direction + ' · ' + md(t.minutes || durationMin) + ' min · stake $' + md(STAKE) + '\n' +
+          'Price: ' + md(price) + ' · Confidence: ' + md(a.confidence) + '%\n' +
+          'Why: ' + md(a.reason) + '\n' +
+          'Contract: ' + md(t.contract_id) + '\n' +
+          (t.balance_after !== undefined ? 'Balance: ' + md(t.balance_after) + '\n' : '') +
+          '\n🤖 Auto\\-trading \\(' + md(isDemoAccount() ? 'demo' : 'REAL') + '\\) · ⏰ ' + md(time)
+        );
+      }).catch(function (e) {
+        if (/not offered|duration|closed|not available/i.test(e.message)) {
+          blockedUntil[pair.symbol] = Date.now() + 6 * 60 * 60 * 1000;
+        } else {
+          lastSignalAt[pair.symbol] = Date.now();
+        }
+        return sendTelegram('⚠️ Auto\\-trade blocked on ' + md(pair.display) + ': ' + md(e.message));
+      });
+    }
+
     // ----- Manual signal -----
     signalCount++;
     lastSignalAt[pair.symbol] = Date.now();
@@ -45,6 +188,7 @@ function tick() {
     .then(maybeDailySummary)
     .then(dispatchSignal)
     .then(function () { return ensureNews().then(maybeNewsTrade); })
+    .then(maybeEvolvedTrade)
     .catch(function (e) { console.error('Tick error: ' + e.message); })
     .then(function () { scanning = false; });
 }
@@ -322,7 +466,7 @@ function deepProcess(key, c, agg) {
   for (let i = 79; i < cl.length; i++) votesAt[i] = getVotes(cl.slice(i - 79, i + 1)).votes;
 
   let seed = 12345 + key.length * 977;
-  const rnd = function () { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+  const rnd = function () { seed = (seed + 0x6D2B79F5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
   const voteFor = function (k) {
     if (k === 'random') return function () { return rnd() < 0.5 ? 1 : -1; };
     if (k === 'combo') return function (i) { return comboVote(votesAt[i]); };
@@ -397,215 +541,5 @@ function deepReport(agg, info) {
     L.push('*' + md('Verdict: no strategy clearly beats random entries.') + '*');
   }
   return L.join('\n');
-}
-
-function runDeepTest() {
-  const keys = Object.keys(SYMBOL_MAP);
-  const agg = emptyAgg();
-  const errors = [];
-  let markets = 0;
-  let maxSpan = 0;
-  return keys.reduce(function (chain, key) {
-    return chain.then(function () {
-      return fetchPaged(key, DEEP_PAGES, errors).then(function (c) {
-        if (!c || c.length < 500) return null;
-        markets++;
-        maxSpan = Math.max(maxSpan, (c[c.length - 1].t - c[0].t) / 86400);
-        deepProcess(key, c, agg);
-        return new Promise(function (r) { setImmediate(r); });
-      });
-    });
-  }, Promise.resolve()).then(function () {
-    if (markets === 0) throw new Error('No market data could be loaded. ' + (errors[0] || ''));
-    if (errors.length) console.error('Deep test notes: ' + errors.slice(0, 3).join(' | '));
-    return deepReport(agg, { markets: markets, days: Math.round(maxSpan) });
-  });
-}
-
-// ---------- Strategy research (/strategytest) ----------
-// Tests 15 strategy modules one at a time, plus a random-entry control, on hourly
-// Capital.com candles. Same data, costs and rules for every module.
-//  - Signal is read at the close of a bar; the trade enters at the NEXT bar open (no look-ahead).
-//  - One trade at a time per module and market (no duplicate or overlapping signals).
-//  - Stop loss = ATR x multiple, take profit = stop x RR, forced exit after 48 bars.
-//  - If stop and target are both inside one bar, the stop is assumed to hit first.
-//  - Cost per trade = the real bid/ask spread at entry, plus an assumed slippage (STRAT_SLIP).
-//  - Swap is NOT known; set STRAT_SWAP_R (R per night) if you want to model it.
-//  - Periods are chronological: first 50% train, next 25% validation, last 25% out-of-sample.
-// Nothing is optimised on the data: parameters are fixed in advance. Sensitivity runs only
-// show how results change if the stop and target are changed.
-
-let stratRunning = false;
-const STRAT_PAGES = Number(process.env.STRAT_PAGES || 8);        // 1000 hourly bars per page
-const STRAT_SLIP = Number(process.env.STRAT_SLIP || 0.5);        // extra slippage as a share of the spread
-const STRAT_SWAP_R = Number(process.env.STRAT_SWAP_R || 0);      // swap cost in R per night held
-const ST_WARM = 210;
-const ST_MAXHOLD = 48;
-const ST_MARKETS = ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCAD', 'GOLD'];
-const ST_VARIANTS = [
-  { sl: 1.5, rr: 2, name: 'SL1.5 RR2' },   // the default, listed first
-  { sl: 1.0, rr: 2, name: 'SL1.0 RR2' },
-  { sl: 2.0, rr: 2, name: 'SL2.0 RR2' },
-  { sl: 1.5, rr: 1.5, name: 'SL1.5 RR1.5' },
-  { sl: 1.5, rr: 3, name: 'SL1.5 RR3' },
-];
-const ST_STRATS = [
-  ['ema', 'EMA trend'], ['mtf', 'Multi-timeframe trend'], ['pull', 'Trend pullback'],
-  ['adx', 'ADX trend'], ['donch', 'Donchian breakout'], ['srb', 'S/R breakout'],
-  ['retest', 'Breakout retest'], ['asian', 'Asian range breakout'], ['bbmr', 'Bollinger reversion'],
-  ['rsimr', 'RSI reversion'], ['macd', 'MACD momentum'], ['candle', 'Candle reversal'],
-  ['pday', 'Prev-day breakout'], ['atrb', 'ATR breakout'], ['ichi', 'Ichimoku trend'],
-  ['rand', 'RANDOM (control)'],
-];
-
-function stIso(ms) { return new Date(ms).toISOString().slice(0, 19); }
-
-// Hourly candles from Capital.com, newest pages first, joined oldest to newest
-function stFetchHistory(symbol, pages, errors) {
-  return capEpic(symbol).then(function (epic) {
-    let all = [];
-    const step = function (p, to) {
-      if (p >= pages) return Promise.resolve(all);
-      return capCall('GET', '/prices/' + epic + '?resolution=HOUR&max=1000' + (to ? '&to=' + to : '')).then(function (j) {
-        const arr = (j.prices || []).map(function (x) {
-          const m = function (o) { return (Number(o.bid) + Number(o.ask)) / 2; };
-          return {
-            t: Date.parse((x.snapshotTimeUTC || x.snapshotTime) + 'Z'),
-            o: m(x.openPrice), h: m(x.highPrice), l: m(x.lowPrice), c: m(x.closePrice),
-            sp: Math.abs(Number(x.openPrice.ask) - Number(x.openPrice.bid)),
-          };
-        }).filter(function (b) { return !isNaN(b.t) && b.h > 0; });
-        if (!arr.length) return all;
-        arr.sort(function (a, b) { return a.t - b.t; });
-        all = arr.concat(all);
-        return step(p + 1, stIso(arr[0].t - 1000));
-      }).catch(function (e) {
-        errors.push(symbol + ' page ' + (p + 1) + ': ' + e.message);
-        return all;
-      });
-    };
-    return step(0, null);
-  }).then(function (all) {
-    const seen = {};
-    return all.filter(function (b) { if (seen[b.t]) return false; seen[b.t] = true; return true; })
-      .sort(function (a, b) { return a.t - b.t; });
-  });
-}
-
-// ----- indicators over arrays -----
-function stEma(a, p) {
-  const out = new Array(a.length);
-  const k = 2 / (p + 1);
-  out[0] = a[0];
-  for (let i = 1; i < a.length; i++) out[i] = a[i] * k + out[i - 1] * (1 - k);
-  return out;
-}
-function stWilder(a, p, start) {
-  const out = new Array(a.length).fill(NaN);
-  let sum = 0;
-  for (let i = start; i < start + p; i++) sum += a[i];
-  out[start + p - 1] = sum / p;
-  for (let i = start + p; i < a.length; i++) out[i] = (out[i - 1] * (p - 1) + a[i]) / p;
-  return out;
-}
-function stBuild(bars) {
-  const n = bars.length;
-  const o = bars.map(function (b) { return b.o; }), h = bars.map(function (b) { return b.h; });
-  const l = bars.map(function (b) { return b.l; }), c = bars.map(function (b) { return b.c; });
-  const D = { n: n, bars: bars, o: o, h: h, l: l, c: c, sp: bars.map(function (b) { return b.sp; }) };
-  const tr = [0], pdm = [0], mdm = [0];
-  for (let i = 1; i < n; i++) {
-    tr.push(Math.max(h[i] - l[i], Math.abs(h[i] - c[i - 1]), Math.abs(l[i] - c[i - 1])));
-    const up = h[i] - h[i - 1], dn = l[i - 1] - l[i];
-    pdm.push(up > dn && up > 0 ? up : 0);
-    mdm.push(dn > up && dn > 0 ? dn : 0);
-  }
-  D.atr = stWilder(tr, 14, 1);
-  const str = stWilder(tr, 14, 1), sp = stWilder(pdm, 14, 1), sm = stWilder(mdm, 14, 1);
-  D.pdi = new Array(n).fill(NaN); D.mdi = new Array(n).fill(NaN);
-  const dx = new Array(n).fill(0);
-  for (let i = 0; i < n; i++) {
-    if (str[i] > 0) {
-      D.pdi[i] = 100 * sp[i] / str[i]; D.mdi[i] = 100 * sm[i] / str[i];
-      const sum = D.pdi[i] + D.mdi[i];
-      dx[i] = sum > 0 ? 100 * Math.abs(D.pdi[i] - D.mdi[i]) / sum : 0;
-    }
-  }
-  D.adx = stWilder(dx, 14, 14);
-  D.ema20 = stEma(c, 20); D.ema50 = stEma(c, 50); D.ema200 = stEma(c, 200);
-  // RSI (Wilder)
-  const gain = [0], loss = [0];
-  for (let i = 1; i < n; i++) { const d = c[i] - c[i - 1]; gain.push(d > 0 ? d : 0); loss.push(d < 0 ? -d : 0); }
-  const ag = stWilder(gain, 14, 1), al = stWilder(loss, 14, 1);
-  D.rsi = ag.map(function (g, i) { return al[i] === 0 ? 100 : 100 - 100 / (1 + g / al[i]); });
-  // MACD histogram
-  const e12 = stEma(c, 12), e26 = stEma(c, 26);
-  const macdLine = e12.map(function (v, i) { return v - e26[i]; });
-  const sig9 = stEma(macdLine, 9);
-  D.hist = macdLine.map(function (v, i) { return v - sig9[i]; });
-  // Bollinger (20, 2)
-  D.bbU = new Array(n).fill(NaN); D.bbL = new Array(n).fill(NaN);
-  for (let i = 19; i < n; i++) {
-    let s = 0;
-    for (let k = i - 19; k <= i; k++) s += c[k];
-    const mean = s / 20;
-    let v = 0;
-    for (let k = i - 19; k <= i; k++) v += (c[k] - mean) * (c[k] - mean);
-    const sd = Math.sqrt(v / 20);
-    D.bbU[i] = mean + 2 * sd; D.bbL[i] = mean - 2 * sd;
-  }
-  // Donchian 20 of the PRIOR bars, and the 10 prior bars' extremes
-  D.dHi = new Array(n).fill(NaN); D.dLo = new Array(n).fill(NaN);
-  D.p10Hi = new Array(n).fill(NaN); D.p10Lo = new Array(n).fill(NaN);
-  for (let i = 20; i < n; i++) {
-    let hi = -Infinity, lo = Infinity;
-    for (let k = i - 20; k < i; k++) { if (h[k] > hi) hi = h[k]; if (l[k] < lo) lo = l[k]; }
-    D.dHi[i] = hi; D.dLo[i] = lo;
-    let hi2 = -Infinity, lo2 = Infinity;
-    for (let k = i - 10; k < i; k++) { if (h[k] > hi2) hi2 = h[k]; if (l[k] < lo2) lo2 = l[k]; }
-    D.p10Hi[i] = hi2; D.p10Lo[i] = lo2;
-  }
-  // Ichimoku (cloud shifted 26 bars forward, so no look-ahead)
-  const hl = function (i, p) {
-    let hi = -Infinity, lo = Infinity;
-    for (let k = i - p + 1; k <= i; k++) { if (h[k] > hi) hi = h[k]; if (l[k] < lo) lo = l[k]; }
-    return (hi + lo) / 2;
-  };
-  D.tenkan = new Array(n).fill(NaN); D.kijun = new Array(n).fill(NaN);
-  D.cloudTop = new Array(n).fill(NaN); D.cloudBot = new Array(n).fill(NaN);
-  for (let i = 51; i < n; i++) { D.tenkan[i] = hl(i, 9); D.kijun[i] = hl(i, 26); }
-  for (let i = 51 + 26; i < n; i++) {
-    const j = i - 26;
-    const a = (D.tenkan[j] + D.kijun[j]) / 2, b = hl(j, 52);
-    D.cloudTop[i] = Math.max(a, b); D.cloudBot[i] = Math.min(a, b);
-  }
-  // Higher timeframe (4h) trend, using only completed 4h bars
-  D.h4up = new Array(n).fill(0);
-  let h4ema = NaN, h4state = 0, curId = null;
-  const k4 = 2 / 51;
-  for (let i = 0; i < n; i++) {
-    const id = Math.floor(bars[i].t / 14400000);
-    if (curId !== null && id !== curId) {
-      const closed = c[i - 1];
-      h4ema = isNaN(h4ema) ? closed : closed * k4 + h4ema * (1 - k4);
-      h4state = closed > h4ema ? 1 : -1;
-    }
-    curId = id;
-    D.h4up[i] = h4state;
-  }
-  // Previous UTC day high and low, and today's Asian range (00:00 to 07:00 UTC)
-  D.pdH = new Array(n).fill(NaN); D.pdL = new Array(n).fill(NaN);
-  let day = null, dH = -Infinity, dL = Infinity, pH = NaN, pL = NaN;
-  for (let i = 0; i < n; i++) {
-    const d = new Date(bars[i].t).toISOString().slice(0, 10);
-    if (d !== day) { if (day !== null) { pH = dH; pL = dL; } day = d; dH = -Infinity; dL = Infinity; }
-    D.pdH[i] = pH; D.pdL[i] = pL;
-    if (h[i] > dH) dH = h[i];
-    if (l[i] < dL) dL = l[i];
-  }
-  // typical spread, to reject abnormal spreads
-  const sps = D.sp.filter(function (x) { return x > 0; }).sort(function (a, b) { return a - b; });
-  D.medSp = sps.length ? sps[Math.floor(sps.length / 2)] : 0;
-  return D;
 }
 
