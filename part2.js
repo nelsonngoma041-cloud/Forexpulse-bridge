@@ -1,3 +1,51 @@
+// Open a demo position with stop loss and take profit
+function capitalTrade(symbol, action, opts) {
+  return capEpic(symbol).then(function (epic) { return capitalTradeEpic(epic, action, opts); });
+}
+
+function capitalTradeEpic(epic, action, opts) {
+  return Promise.all([capCall('GET', '/markets/' + epic), capAtr(epic)]).then(function (res) {
+    const m = res[0];
+    const atr = res[1];
+    const snap = m.snapshot || {};
+    if (snap.marketStatus && snap.marketStatus !== 'TRADEABLE') throw new Error('Market closed: ' + epic);
+    const bid = Number(snap.bid), ask = Number(snap.offer);
+    const price = action === 'BUY' ? ask : bid;
+    const rules = m.dealingRules || {};
+    const minD = rules.minNormalStopOrLimitDistance || rules.minStopOrProfitDistance || {};
+    let minDist = Number(minD.value || 0);
+    if (minD.unit === 'PERCENTAGE') minDist = price * minDist / 100;
+    const spread = Math.abs(ask - bid);
+    let sl = Math.max(atr * capSlAtr, minDist * 1.2, spread * 4);
+    if (opts && opts.sl > 0) sl = Math.max(opts.sl, minDist * 1.2, spread * 4);
+    if (!(sl > 0)) throw new Error('Could not work out a stop distance for ' + epic);
+    const tp = sl * ((opts && opts.rr) || capRR);
+    const minSize = Number((rules.minDealSize || {}).value || 0.01);
+    const step = Number((rules.minSizeIncrement || {}).value || minSize);
+    const maxSize = Number((rules.maxDealSize || {}).value || 1e9);
+    let size = capRisk / sl;
+    size = Math.floor(size / step) * step;
+    size = Math.max(minSize, Math.min(maxSize, Number(size.toFixed(6))));
+    if (size * sl > capRisk * 2.5) throw new Error('Too big for your risk setting: ' + epic + ' (smallest trade would risk $' + (size * sl).toFixed(2) + ')');
+    const body = {
+      epic: epic, direction: action === 'BUY' ? 'BUY' : 'SELL', size: size,
+      stopDistance: Number(sl.toPrecision(6)), profitDistance: Number(tp.toPrecision(6)),
+    };
+    return capCall('POST', '/positions', body).then(function (o) {
+      const ref = o.dealReference;
+      if (!ref) throw new Error('Capital gave no deal reference');
+      return new Promise(function (r) { setTimeout(r, 1200); }).then(function () {
+        return capCall('GET', '/confirms/' + encodeURIComponent(ref));
+      }).then(function (c) {
+        if (c.dealStatus && c.dealStatus !== 'ACCEPTED') throw new Error('Order rejected: ' + (c.reason || c.dealStatus));
+        const deal = (c.affectedDeals && c.affectedDeals[0] && c.affectedDeals[0].dealId) || c.dealId;
+        if (!deal) throw new Error('Order accepted but no deal id came back');
+        return { dealId: deal, size: size, level: c.level || price, sl: sl, tp: tp, riskUsd: size * sl, epic: epic };
+      });
+    });
+  });
+}
+
 // Find out how a closed position ended (profit in account currency)
 function capClosedProfit(dealId, lastUpl) {
   const to = new Date();
@@ -22,7 +70,7 @@ function checkCapitalTrades() {
       return capCall('GET', '/positions/' + encodeURIComponent(t.contractId)).then(function (p) {
         if (p && p.position && p.position.upl !== undefined) t.lastUpl = Number(p.position.upl);
         const ageMin = (Date.now() - t.placedAt) / 60000;
-        if (ageMin >= CAP_MAX_HOLD_MIN) {
+        if (ageMin >= (t.holdMin || CAP_MAX_HOLD_MIN)) {
           // too long open: close it at market, the result is picked up on the next check
           return capCall('DELETE', '/positions/' + encodeURIComponent(t.contractId)).catch(function () { return null; });
         }
@@ -34,6 +82,8 @@ function checkCapitalTrades() {
           if (won) dailyWins++; else dailyLosses++;
           recordResult(won, profit);
           if (t.newsTitle) newsLearn(t, profit);
+          if (t.volTrade) volLearn(t, profit);
+          if (t.evoId) evoLearn(t, profit);
           pendingTrades.splice(pendingTrades.indexOf(t), 1);
           const closedAt = new Date().toISOString();
           memLog.unshift({
@@ -43,7 +93,7 @@ function checkCapitalTrades() {
           if (memLog.length > 500) memLog.pop();
           dbCloseTrade(String(t.contractId), { won: won, profit: profit, closed_at: closedAt });
           closedSinceLearn++;
-          if (closedSinceLearn >= RECOMPUTE_EVERY) { closedSinceLearn = 0; learn(); }
+          if (closedSinceLearn >= RECOMPUTE_EVERY) { closedSinceLearn = 0; learn(true); }
           return sendTelegram(
             (won ? '✅ *WIN*' : '❌ *LOSS*') + ' — ' + md(t.display) + ' ' + md(t.action) + ' \\(Capital demo\\)\n' +
             'Profit: ' + md(profit.toFixed(2)) + '\n' +
@@ -127,8 +177,9 @@ function analyseSymbol(symbol) {
 const SUPABASE_URL = cleanEnv(process.env.SUPABASE_URL).replace(/\/+$/, '');
 const SUPABASE_KEY = cleanEnv(process.env.SUPABASE_KEY);
 const DB_ON = !!(SUPABASE_URL && SUPABASE_KEY);
-const MIN_LEARN_TRADES = 20;   // need this many samples before changing anything
-const RECOMPUTE_EVERY = 5;     // re-learn after this many closed trades
+const MIN_LEARN_TRADES = 10;   // need this many samples before changing anything
+const RECOMPUTE_EVERY = 1;
+const PAIR_PAUSE_MIN = 8;     // re-learn after this many closed trades
 const memLog = [];             // closed trades kept in memory as a fallback
 const pausedPairs = {};        // symbol -> win rate that got it paused
 let closedSinceLearn = 0;
@@ -172,45 +223,91 @@ function dbLoadClosed() {
 }
 
 // Look at past results and adjust strategy weights and pair pauses
-function learn() {
+const PAUSE_HOURS = 24;
+const pairResetAt = {};   // symbol -> time after which its trades count again
+const pairPausedAt = {};
+
+// Score of one closed trade: profit in units of the amount risked (about -1 for a loss, +1 or +2 for a win)
+function tradeScore(t) {
+  const stake = Number(t.stake || 0);
+  const profit = Number(t.profit);
+  if (stake > 0 && !isNaN(profit)) return Math.max(-1, Math.min(2, profit / stake));
+  return t.won ? 1 : -1;
+}
+
+// Learn from every closed trade. Newer trades count more (half-life 40 trades).
+// Steps are small until there are enough trades, so one result cannot swing the bot.
+function learn(announce) {
   return dbLoadClosed().then(function (rows) {
+    const old = {};
+    STRATEGIES.forEach(function (k) { old[k] = weights[k]; });
     const stats = {};
-    STRATEGIES.forEach(function (k) { stats[k] = { n: 0, w: 0 }; });
+    STRATEGIES.forEach(function (k) { stats[k] = { n: 0, ws: 0, wn: 0 }; });
     const pairStats = {};
 
-    rows.forEach(function (t) {
+    rows.forEach(function (t, idx) {
       const dir = t.action === 'BUY' ? 1 : -1;
       const votes = t.votes || {};
+      const rw = Math.pow(0.5, idx / 40);
+      const sc = tradeScore(t);
       STRATEGIES.forEach(function (k) {
-        if (votes[k] === dir) { stats[k].n++; if (t.won) stats[k].w++; }
+        if (votes[k] === dir) { stats[k].n++; stats[k].ws += sc * rw; stats[k].wn += rw; }
       });
-      const p = pairStats[t.symbol] || (pairStats[t.symbol] = { n: 0, w: 0 });
-      p.n++; if (t.won) p.w++;
+      const closed = Date.parse(t.closed_at || '') || 0;
+      if (closed > (pairResetAt[t.symbol] || 0)) {
+        const p = pairStats[t.symbol] || (pairStats[t.symbol] = { n: 0, ws: 0, wn: 0 });
+        p.n++; p.ws += sc * rw; p.wn += rw;
+      }
     });
 
     const lines = [];
     STRATEGIES.forEach(function (k) {
       const s = stats[k];
       if (s.n >= MIN_LEARN_TRADES) {
-        const wr = s.w / s.n;
+        const avg = s.ws / s.wn;                    // average score, recent trades weighted more
         const trust = Math.min(1, s.n / 60);
-        weights[k] = Math.max(0.2, Math.min(2, 1 + (wr - 0.5) * 4 * trust));
+        weights[k] = Math.max(0.2, Math.min(2, 1 + Math.max(-0.6, Math.min(0.6, avg)) * trust));
       } else {
         weights[k] = 1;
       }
-      lines.push(STRAT_NAMES[k] + ': ' + s.w + '/' + s.n + (s.n ? ' (' + Math.round(s.w / s.n * 100) + '%)' : '') +
+      lines.push(STRAT_NAMES[k] + ': ' + s.n + ' trades' + (s.n ? ', avg ' + (s.ws / s.wn).toFixed(2) + 'R' : '') +
         ' weight ' + weights[k].toFixed(2));
     });
 
+    // Pause a market whose recent average result is clearly negative; retry after PAUSE_HOURS
+    const now = Date.now();
     Object.keys(pausedPairs).forEach(function (k) { delete pausedPairs[k]; });
     Object.keys(pairStats).forEach(function (sym) {
       const p = pairStats[sym];
-      if (p.n >= MIN_LEARN_TRADES && p.w / p.n < 0.35) pausedPairs[sym] = Math.round(p.w / p.n * 100);
+      if (p.n >= PAIR_PAUSE_MIN && p.ws / p.wn < -0.4) {
+        if (!pairPausedAt[sym]) pairPausedAt[sym] = now;
+        if (now - pairPausedAt[sym] > PAUSE_HOURS * 3600000) {
+          delete pairPausedAt[sym];
+          pairResetAt[sym] = now;            // fresh start: old losses no longer count
+        } else {
+          pausedPairs[sym] = Math.round(p.ws / p.wn * 100) / 100;
+        }
+      } else {
+        delete pairPausedAt[sym];
+      }
     });
 
     lastLearnInfo = 'Trades studied: ' + rows.length + '\n' + lines.join('\n') +
-      (Object.keys(pausedPairs).length ? '\nPaused pairs: ' + Object.keys(pausedPairs).join(', ') : '');
+      (Object.keys(pausedPairs).length ? '\nPaused markets: ' + Object.keys(pausedPairs).join(', ') : '');
     console.log('Learned from ' + rows.length + ' trades');
+
+    if (announce) {
+      const ch = [];
+      STRATEGIES.forEach(function (k) {
+        if (Math.abs(weights[k] - old[k]) >= 0.01) ch.push(STRAT_NAMES[k] + ' ' + old[k].toFixed(2) + ' to ' + weights[k].toFixed(2));
+      });
+      const pz = Object.keys(pausedPairs);
+      return sendTelegram('🧠 *Learned from that trade*\n' +
+        md(rows.length < MIN_LEARN_TRADES ? 'Only ' + rows.length + ' trades so far. Weights stay at 1.00 until ' + MIN_LEARN_TRADES + ' trades.' :
+          (ch.length ? 'Weights: ' + ch.join(', ') : 'No weight change.')) +
+        (pz.length ? '\n' + md('Paused markets: ' + pz.join(', ')) : ''));
+    }
+    return null;
   }).catch(function (e) { console.error('Learn failed: ' + e.message); });
 }
 
@@ -253,7 +350,7 @@ function checkPendingTrades() {
         if (memLog.length > 500) memLog.pop();
         dbCloseTrade(String(t.contractId), { won: won, profit: profit, closed_at: closedRow.closed_at });
         closedSinceLearn++;
-        if (closedSinceLearn >= RECOMPUTE_EVERY) { closedSinceLearn = 0; learn(); }
+        if (closedSinceLearn >= RECOMPUTE_EVERY) { closedSinceLearn = 0; learn(true); }
         return sendTelegram(
           (won ? '✅ *WIN*' : '❌ *LOSS*') + ' — ' + md(t.display) + ' ' + md(t.action) + '\n' +
           'Profit: ' + md(profit.toFixed(2)) + '\n' +
@@ -497,143 +594,4 @@ function maybeNewsTrade() {
     }, chain);
   }, Promise.resolve());
 }
-
-function dispatchSignal() {
-  return ensureNews().then(dispatchSignalInner);
-}
-
-// true if this pair is on hold for news (and tells you once per event)
-function newsHold(p) {
-  if (p.type === 'derived') return false;
-  const e = newsBlock(p.symbol);
-  if (!e) return false;
-  const key = e.t + e.ccy + e.title;
-  if (!newsNotified[key]) {
-    newsNotified[key] = true;
-    sendTelegram('📰 *News hold*: ' + md(e.ccy + ' ' + e.title) + ' at ' + md(lusakaStamp(e.t)) + '\\. No new ' + md(e.ccy) + ' trades from ' + md(NEWS_BEFORE_MIN) + ' min before to ' + md(NEWS_AFTER_MIN) + ' min after\\.');
-  }
-  return true;
-}
-
-function dispatchSignalInner() {
-  if (autoTrade && circuitOpen) {
-    const d = new Date().toISOString().slice(0, 10);
-    if (d !== pnlDay) { pnlDay = d; dayPnl = 0; consecLosses = 0; circuitOpen = false; circuitNotified = false; }
-    else return Promise.resolve();
-  }
-  // Daily limit: say it once, then stay quiet until the next day
-  if (autoTrade) {
-    const day = new Date().toISOString().slice(0, 10);
-    if (day !== tradeDay) { tradeDay = day; tradesToday = 0; }
-    if (tradesToday >= maxTradesPerDay) {
-      if (limitNotifiedDay === day) return Promise.resolve();
-      limitNotifiedDay = day;
-      return sendTelegram('🛑 Daily limit of ' + md(maxTradesPerDay) + ' trades reached\. No more trades until tomorrow \(02:00 Zambia time\)\. Use /limit 40 to raise it\.');
-    }
-  }
-  const session = getSession();
-  if (process.env.SKIP_LOW_SESSION === 'true' && session.quality === 0) return Promise.resolve();
-
-  const pairs = availablePairs().filter(function (p) {
-    return Date.now() - (lastSignalAt[p.symbol] || 0) > COOLDOWN_MS &&
-      Date.now() > (blockedUntil[p.symbol] || 0) &&
-      !(p.symbol in pausedPairs) &&
-      !newsHold(p);
-  });
-
-  return Promise.all(pairs.map(function (p) {
-    return analyseSymbol(p.symbol).then(function (a) { return { pair: p, a: a }; });
-  })).then(function (results) {
-    const valid = results.filter(function (r) {
-      return r.a && r.a.action !== 'WAIT' && r.a.confidence >= MIN_CONFIDENCE;
-    }).sort(function (x, y) { return y.a.confidence - x.a.confidence; });
-
-    if (valid.length === 0) { console.log('No clear setup this round'); return null; }
-
-    const place = function (pick) {
-    const pair = pick.pair;
-    const a = pick.a;
-    const time = lusakaTime();
-    const emoji = a.action === 'BUY' ? '🟢📈' : '🔴📉';
-    const direction = a.action === 'BUY' ? 'Rise' : 'Fall';
-    const price = a.price.toFixed(pair.decimals);
-
-    const record = function () {
-      recentSignals.unshift({
-        id: String(Date.now()), symbol: pair.display, action: a.action,
-        confidence: a.confidence, rsi: a.rsi, time: time.slice(0, 5),
-        type: pair.type, priceSource: 'live',
-      });
-      if (recentSignals.length > 20) recentSignals.pop();
-    };
-
-    // ----- Auto trade -----
-    if (autoTrade) {
-      if (pendingTrades.some(function (t) { return t.display === pair.display; })) return null;
-      if (pendingTrades.length >= (tradeBroker === 'both' ? 6 : MAX_OPEN_TRADES)) return null;
-      if (tradeBroker !== 'deriv' && pair.type !== 'derived') {
-        return capitalTrade(pair.symbol, a.action).then(function (t) {
-          signalCount++;
-          tradesToday++;
-          lastSignalAt[pair.symbol] = Date.now();
-          pendingTrades.push({
-            contractId: t.dealId, display: pair.display, symbol: pair.symbol, action: a.action,
-            placedAt: Date.now(), votes: a.votes || {}, minutes: CAP_MAX_HOLD_MIN, broker: 'capital',
-          });
-          dbInsertTrade({
-            contract_id: String(t.dealId), symbol: pair.symbol, action: a.action,
-            confidence: a.confidence, votes: a.votes || {}, rsi: a.rsi,
-            hour: lusakaHour(), stake: Number(t.riskUsd.toFixed(2)), demo: true,
-          });
-          record();
-          return sendTelegram(
-            emoji + ' *TRADE PLACED — ' + md(pair.display) + '* \\(Capital demo\\)\n\n' +
-            md(a.action) + ' · size ' + md(t.size) + ' · risk about $' + md(t.riskUsd.toFixed(2)) + '\n' +
-            'Entry: ' + md(Number(t.level).toFixed(pair.decimals)) + '\n' +
-            'Stop loss: ' + md(t.sl.toPrecision(4)) + ' away · Take profit: ' + md(t.tp.toPrecision(4)) + ' away\n' +
-            'Confidence: ' + md(a.confidence) + '% · Why: ' + md(a.reason) + '\n' +
-            '\n🤖 Auto\\-trading · ⏰ ' + md(time)
-          );
-        }).catch(function (e) {
-          if (/closed|not offered|not tradeable|not available|too big/i.test(e.message)) {
-            blockedUntil[pair.symbol] = Date.now() + 60 * 60 * 1000;
-            console.log('Capital skip ' + pair.symbol + ': ' + e.message);
-            return null;
-          }
-          lastSignalAt[pair.symbol] = Date.now();
-          return sendTelegram('⚠️ Capital trade blocked on ' + md(pair.display) + ': ' + md(e.message));
-        });
-      }
-      if (tradeBroker === 'capital') return null;
-      return placeTrade(pair.symbol, a.action, STAKE).then(function (t) {
-        signalCount++;
-        lastSignalAt[pair.symbol] = Date.now();
-        pendingTrades.push({
-          contractId: t.contract_id, display: pair.display, symbol: pair.symbol,
-          action: a.action, placedAt: Date.now(), votes: a.votes || {}, minutes: t.minutes || durationMin,
-        });
-        dbInsertTrade({
-          contract_id: String(t.contract_id), symbol: pair.symbol, action: a.action,
-          confidence: a.confidence, votes: a.votes || {}, rsi: a.rsi,
-          hour: lusakaHour(), stake: STAKE, demo: isDemoAccount(),
-        });
-        record();
-        return sendTelegram(
-          emoji + ' *TRADE PLACED — ' + md(pair.display) + '*\n\n' +
-          direction + ' · ' + md(t.minutes || durationMin) + ' min · stake $' + md(STAKE) + '\n' +
-          'Price: ' + md(price) + ' · Confidence: ' + md(a.confidence) + '%\n' +
-          'Why: ' + md(a.reason) + '\n' +
-          'Contract: ' + md(t.contract_id) + '\n' +
-          (t.balance_after !== undefined ? 'Balance: ' + md(t.balance_after) + '\n' : '') +
-          '\n🤖 Auto\\-trading \\(' + md(isDemoAccount() ? 'demo' : 'REAL') + '\\) · ⏰ ' + md(time)
-        );
-      }).catch(function (e) {
-        if (/not offered|duration|closed|not available/i.test(e.message)) {
-          blockedUntil[pair.symbol] = Date.now() + 6 * 60 * 60 * 1000;
-        } else {
-          lastSignalAt[pair.symbol] = Date.now();
-        }
-        return sendTelegram('⚠️ Auto\\-trade blocked on ' + md(pair.display) + ': ' + md(e.message));
-      });
-    }
 
