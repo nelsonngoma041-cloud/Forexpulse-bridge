@@ -1,73 +1,3 @@
-// ---------- Strategy research (/strategytest) ----------
-// Tests 15 strategy modules one at a time, plus a random-entry control, on hourly
-// Capital.com candles. Same data, costs and rules for every module.
-//  - Signal is read at the close of a bar; the trade enters at the NEXT bar open (no look-ahead).
-//  - One trade at a time per module and market (no duplicate or overlapping signals).
-//  - Stop loss = ATR x multiple, take profit = stop x RR, forced exit after 48 bars.
-//  - If stop and target are both inside one bar, the stop is assumed to hit first.
-//  - Cost per trade = the real bid/ask spread at entry, plus an assumed slippage (STRAT_SLIP).
-//  - Swap is NOT known; set STRAT_SWAP_R (R per night) if you want to model it.
-//  - Periods are chronological: first 50% train, next 25% validation, last 25% out-of-sample.
-// Nothing is optimised on the data: parameters are fixed in advance. Sensitivity runs only
-// show how results change if the stop and target are changed.
-
-let stratRunning = false;
-const STRAT_PAGES = Number(process.env.STRAT_PAGES || 8);        // 1000 hourly bars per page
-const STRAT_SLIP = Number(process.env.STRAT_SLIP || 0.5);        // extra slippage as a share of the spread
-const STRAT_SWAP_R = Number(process.env.STRAT_SWAP_R || 0);      // swap cost in R per night held
-const ST_WARM = 210;
-const ST_MAXHOLD = 48;
-const ST_MARKETS = ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCAD', 'GOLD'];
-const ST_VARIANTS = [
-  { sl: 1.5, rr: 2, name: 'SL1.5 RR2' },   // the default, listed first
-  { sl: 1.0, rr: 2, name: 'SL1.0 RR2' },
-  { sl: 2.0, rr: 2, name: 'SL2.0 RR2' },
-  { sl: 1.5, rr: 1.5, name: 'SL1.5 RR1.5' },
-  { sl: 1.5, rr: 3, name: 'SL1.5 RR3' },
-];
-const ST_STRATS = [
-  ['ema', 'EMA trend'], ['mtf', 'Multi-timeframe trend'], ['pull', 'Trend pullback'],
-  ['adx', 'ADX trend'], ['donch', 'Donchian breakout'], ['srb', 'S/R breakout'],
-  ['retest', 'Breakout retest'], ['asian', 'Asian range breakout'], ['bbmr', 'Bollinger reversion'],
-  ['rsimr', 'RSI reversion'], ['macd', 'MACD momentum'], ['candle', 'Candle reversal'],
-  ['pday', 'Prev-day breakout'], ['atrb', 'ATR breakout'], ['ichi', 'Ichimoku trend'],
-  ['rand', 'RANDOM (control)'],
-];
-
-function stIso(ms) { return new Date(ms).toISOString().slice(0, 19); }
-
-// Hourly candles from Capital.com, newest pages first, joined oldest to newest
-function stFetchHistory(symbol, pages, errors) {
-  return capEpic(symbol).then(function (epic) {
-    let all = [];
-    const step = function (p, to) {
-      if (p >= pages) return Promise.resolve(all);
-      return capCall('GET', '/prices/' + epic + '?resolution=HOUR&max=1000' + (to ? '&to=' + to : '')).then(function (j) {
-        const arr = (j.prices || []).map(function (x) {
-          const m = function (o) { return (Number(o.bid) + Number(o.ask)) / 2; };
-          return {
-            t: Date.parse((x.snapshotTimeUTC || x.snapshotTime) + 'Z'),
-            o: m(x.openPrice), h: m(x.highPrice), l: m(x.lowPrice), c: m(x.closePrice),
-            sp: Math.abs(Number(x.openPrice.ask) - Number(x.openPrice.bid)),
-          };
-        }).filter(function (b) { return !isNaN(b.t) && b.h > 0; });
-        if (!arr.length) return all;
-        arr.sort(function (a, b) { return a.t - b.t; });
-        all = arr.concat(all);
-        return step(p + 1, stIso(arr[0].t - 1000));
-      }).catch(function (e) {
-        errors.push(symbol + ' page ' + (p + 1) + ': ' + e.message);
-        return all;
-      });
-    };
-    return step(0, null);
-  }).then(function (all) {
-    const seen = {};
-    return all.filter(function (b) { if (seen[b.t]) return false; seen[b.t] = true; return true; })
-      .sort(function (a, b) { return a.t - b.t; });
-  });
-}
-
 // ----- indicators over arrays -----
 function stEma(a, p) {
   const out = new Array(a.length);
@@ -445,4 +375,46 @@ function runStrategyTest() {
         '%, max DD ' + dd.toFixed(1) + 'R, ' + posVar + '/5 settings positive -> ' + verdict) + mark);
     });
     msgs.push(lines.join('\n'));
+
+    // Regime split and rejections
+    const rl = ['*' + md('Results by market condition (net R/trade, trades)') + '*'];
+    ST_STRATS.forEach(function (s) {
+      const r = reg[s[0]];
+      const f = function (x) { return x.n ? stF(stExp(x)) + ' (' + x.n + ')' : 'none'; };
+      rl.push(md(s[1] + ': trending ' + f(r.trending) + ' | ranging ' + f(r.ranging) + ' | volatile ' + f(r.volatile) + ' | mixed ' + f(r.mixed)));
+    });
+    rl.push('');
+    rl.push(md('Rejected signals (all strategies): ' + (function () {
+      let ov = 0, ws = 0, na = 0;
+      Object.keys(rej).forEach(function (k) { ov += rej[k].overlap; ws += rej[k].wideSpread; na += rej[k].noAtr; });
+      return ov + ' overlapping a trade, ' + ws + ' with spread over 3x normal, ' + na + ' with no ATR.';
+    })()));
+    msgs.push(rl.join('\n'));
+
+    const fin = [];
+    if (cands.length) {
+      fin.push('*' + md('Worth demo testing next (not proven):') + '*');
+      cands.forEach(function (k) {
+        const a = acc[k][0];
+        const net = a[0].sumR + a[1].sumR + a[2].sumR;
+        fin.push(md('• ' + ST_STRATS.filter(function (x) { return x[0] === k; })[0][1] + ': total ' + stF(net, 1) + 'R, about ' + stF(net * capRisk, 0) + ' dollars at $' + capRisk + ' risk per trade'));
+      });
+      fin.push(md('Out-of-sample is a single period, so even candidates can be luck. Confirm on demo before trusting them.'));
+    } else {
+      fin.push('*' + md('Verdict: no module passed all tests (positive in train, validation and out-of-sample, profit factor 1.15+, stable across settings, and better than random entries).') + '*');
+      fin.push(md('Do not use win rate alone to judge any of these. Nothing here supports going live.'));
+    }
+    msgs.push(fin.join('\n'));
+    return { msgs: msgs, rows: allRows };
+  });
+}
+
+// ---------- Volatile-market mode ----------
+// "Volatile" = the hourly ATR is more than VOL_MULT times its average over the last 100 hours.
+// /volatiletest checks, on history, whether trading only in those conditions helps.
+// /volatile on makes the Capital.com demo trades wait for volatile conditions (off by default).
+let volatileMode = process.env.VOLATILE_MODE === 'on';
+const VOL_MULT = Number(process.env.VOL_MULT || 1.5);
+let volRunning = false;
+const volStats = { n: 0, sum: 0, w: 0 };
 
