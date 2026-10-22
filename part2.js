@@ -1,50 +1,3 @@
-// ---------- Capital.com (DEMO only) with stop loss and take profit ----------
-// Set TRADE_BROKER=capital (or send /broker capital) to trade forex and metals
-// on the Capital.com demo account. Volatility indices stay on Deriv.
-// Needs CAPITAL_API_KEY, CAPITAL_API_PASSWORD, CAPITAL_EMAIL in Render.
-
-const CAP_BASE = 'https://demo-api-capital.backend-capital.com/api/v1';
-const CAP_KEY = cleanEnv(process.env.CAPITAL_API_KEY);
-const CAP_PASS = cleanEnv(process.env.CAPITAL_API_PASSWORD);
-const CAP_EMAIL = cleanEnv(process.env.CAPITAL_EMAIL);
-const CAP_ON = !!(CAP_KEY && CAP_PASS && CAP_EMAIL);
-let tradeBroker = (function () { const b = (process.env.TRADE_BROKER || 'deriv').toLowerCase(); return (b === 'capital' || b === 'both') ? b : 'deriv'; })();
-let capRisk = Number(process.env.CAP_RISK || 3);              // dollars risked per trade (the stop loss)
-let capSlAtr = Number(process.env.CAP_SL_ATR || 3);           // stop loss = this many 1-min ATRs
-let capRR = Number(process.env.CAP_RR || 2);                  // take profit = stop loss x this
-const CAP_MAX_HOLD_MIN = Number(process.env.CAP_MAX_HOLD_MIN || 120);
-const CAP_RESOLVED = {};   // symbol -> real Capital.com epic
-let capNext = 0;
-function capThrottle() {   // stay under the 10 requests per second limit
-  const now = Date.now();
-  const at = Math.max(now, capNext);
-  capNext = at + 150;
-  return new Promise(function (r) { setTimeout(r, at - now); });
-}
-
-// Find the real market name (epic) on Capital.com, by guess first, then by search
-function capEpic(symbol) {
-  const p = PAIRS.filter(function (x) { return x.symbol === symbol; })[0];
-  if (!p) return Promise.reject(new Error('Not offered on Capital.com: ' + symbol));
-  if (CAP_RESOLVED[symbol]) return Promise.resolve(CAP_RESOLVED[symbol]);
-  const guess = p.epic || p.symbol;
-  return capCall('GET', '/markets/' + encodeURIComponent(guess)).then(function () {
-    CAP_RESOLVED[symbol] = guess;
-    return guess;
-  }).catch(function (e) {
-    if (e.status !== 404 && e.status !== 400) throw e;
-    return capCall('GET', '/markets?searchTerm=' + encodeURIComponent(p.term || p.display)).then(function (j) {
-      const m = (j.markets || [])[0];
-      if (!m || !m.epic) {
-        blockedUntil[symbol] = Date.now() + 6 * 60 * 60 * 1000;
-        throw new Error('Not offered on Capital.com: ' + symbol);
-      }
-      CAP_RESOLVED[symbol] = m.epic;
-      return m.epic;
-    });
-  });
-}
-
 // Recent 1-minute closes from Capital.com, for the signal analysis
 function capCloses(epic) {
   return capCall('GET', '/prices/' + epic + '?resolution=MINUTE&max=100').then(function (j) {
@@ -431,4 +384,38 @@ function learn(announce) {
     lastLearnInfo = 'Trades studied: ' + rows.length + '\n' + lines.join('\n') +
       (Object.keys(pausedPairs).length ? '\nPaused markets: ' + Object.keys(pausedPairs).join(', ') : '');
     console.log('Learned from ' + rows.length + ' trades');
+
+    if (announce) {
+      const ch = [];
+      STRATEGIES.forEach(function (k) {
+        if (Math.abs(weights[k] - old[k]) >= 0.01) ch.push(STRAT_NAMES[k] + ' ' + old[k].toFixed(2) + ' to ' + weights[k].toFixed(2));
+      });
+      const pz = Object.keys(pausedPairs);
+      return sendTelegram('🧠 *Learned from that trade*\n' +
+        md(rows.length < MIN_LEARN_TRADES ? 'Only ' + rows.length + ' trades so far. Weights stay at 1.00 until ' + MIN_LEARN_TRADES + ' trades.' :
+          (ch.length ? 'Weights: ' + ch.join(', ') : 'No weight change.')) +
+        (pz.length ? '\n' + md('Paused markets: ' + pz.join(', ')) : ''));
+    }
+    return null;
+  }).catch(function (e) { console.error('Learn failed: ' + e.message); });
+}
+
+function recordResult(won, profit) {
+  const day = new Date().toISOString().slice(0, 10);
+  if (day !== pnlDay) { pnlDay = day; dayPnl = 0; consecLosses = 0; circuitOpen = false; circuitReason = ''; }
+  dayPnl += profit;
+  consecLosses = won ? 0 : consecLosses + 1;
+  if (!circuitOpen && consecLosses >= MAX_CONSEC_LOSSES) {
+    circuitOpen = true;
+    circuitReason = consecLosses + ' losses in a row';
+  } else if (!circuitOpen && dayPnl <= -MAX_DAILY_LOSS) {
+    circuitOpen = true;
+    circuitReason = 'lost $' + Math.abs(dayPnl).toFixed(2) + ' today';
+  }
+  if (circuitOpen && !circuitNotified) {
+    circuitNotified = true;
+    sendTelegram('🛑 *Auto\\-trading paused*: ' + md(circuitReason) + '\\.\nNo new trades until tomorrow, or send /resume\\.');
+  }
+}
+let circuitNotified = false;
 
