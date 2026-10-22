@@ -1,3 +1,142 @@
+function patChart(D, key) {
+  const n = D.n, h = D.h, l = D.l, c = D.c;
+  const sig = new Int8Array(n), slA = new Float64Array(n), tpA = new Float64Array(n);
+  const PH = [], PL = [];
+  let cool = 0;
+  const put = function (i, s, stop, tgt, minRR) {
+    const risk = s > 0 ? c[i] - stop : stop - c[i];
+    const reward = s > 0 ? tgt - c[i] : c[i] - tgt;
+    if (risk > 0 && reward / risk >= (minRR || SMC_MIN_RR) && i >= cool) { sig[i] = s; slA[i] = stop; tpA[i] = tgt; cool = i + 6; }
+  };
+  const minLow = function (a, b) { let m = Infinity; for (let t = a; t <= b; t++) if (l[t] < m) m = l[t]; return m; };
+  const maxHigh = function (a, b) { let m = -Infinity; for (let t = a; t <= b; t++) if (h[t] > m) m = h[t]; return m; };
+  const used = {};
+  for (let i = 60; i < n; i++) {
+    const k = i - 3;
+    let isH = true, isL = true;
+    for (let j = 1; j <= 3; j++) {
+      if (!(h[k] > h[k - j]) || !(h[k] >= h[k + j])) isH = false;
+      if (!(l[k] < l[k - j]) || !(l[k] <= l[k + j])) isL = false;
+    }
+    if (isH) PH.push({ k: k, p: h[k] });
+    if (isL) PL.push({ k: k, p: l[k] });
+    const atr = D.atr[i];
+    if (!(atr > 0)) continue;
+    if (key === 'dbl') {
+      if (PL.length >= 2) {
+        const L2 = PL[PL.length - 1], L1 = PL[PL.length - 2], id = 'b' + L1.k + '_' + L2.k;
+        if (!used[id] && Math.abs(L1.p - L2.p) <= 0.5 * atr && L2.k - L1.k >= 6 && L2.k - L1.k <= 60 && i - L2.k <= 40) {
+          const neck = maxHigh(L1.k, L2.k), low = Math.min(L1.p, L2.p);
+          if (neck - low >= 2 * atr && c[i] > neck && c[i - 1] <= neck) { used[id] = true; put(i, 1, low - 0.1 * atr, neck + (neck - low), 0.9); }
+        }
+      }
+      if (PH.length >= 2) {
+        const H2 = PH[PH.length - 1], H1 = PH[PH.length - 2], id = 't' + H1.k + '_' + H2.k;
+        if (!used[id] && Math.abs(H1.p - H2.p) <= 0.5 * atr && H2.k - H1.k >= 6 && H2.k - H1.k <= 60 && i - H2.k <= 40) {
+          const neck = minLow(H1.k, H2.k), hi = Math.max(H1.p, H2.p);
+          if (hi - neck >= 2 * atr && c[i] < neck && c[i - 1] >= neck) { used[id] = true; put(i, -1, hi + 0.1 * atr, neck - (hi - neck), 0.9); }
+        }
+      }
+    } else if (key === 'hs') {
+      if (PH.length >= 3) {
+        const P3 = PH[PH.length - 1], P2 = PH[PH.length - 2], P1 = PH[PH.length - 3], id = 'h' + P1.k + '_' + P3.k;
+        if (!used[id] && P2.p > P1.p && P2.p > P3.p && Math.abs(P1.p - P3.p) <= atr && P2.p - Math.max(P1.p, P3.p) >= atr && P3.k - P1.k <= 80 && i - P3.k <= 40) {
+          const neck = minLow(P1.k, P3.k);
+          if (c[i] < neck && c[i - 1] >= neck) { used[id] = true; put(i, -1, P3.p + 0.1 * atr, neck - (P2.p - neck)); }
+        }
+      }
+      if (PL.length >= 3) {
+        const P3 = PL[PL.length - 1], P2 = PL[PL.length - 2], P1 = PL[PL.length - 3], id = 'i' + P1.k + '_' + P3.k;
+        if (!used[id] && P2.p < P1.p && P2.p < P3.p && Math.abs(P1.p - P3.p) <= atr && Math.min(P1.p, P3.p) - P2.p >= atr && P3.k - P1.k <= 80 && i - P3.k <= 40) {
+          const neck = maxHigh(P1.k, P3.k);
+          if (c[i] > neck && c[i - 1] <= neck) { used[id] = true; put(i, 1, P3.p - 0.1 * atr, neck + (neck - P2.p)); }
+        }
+      }
+    } else if (key === 'flag') {
+      for (let m = 5; m <= 12; m++) {
+        const j = i - m;
+        if (j < 10) break;
+        const pole = c[j] - c[j - 5];
+        const hiC = maxHigh(j + 1, i - 1), loC = minLow(j + 1, i - 1);
+        if (pole >= 3 * atr && hiC - loC <= 0.5 * pole && hiC <= h[j] + 0.3 * atr && c[i] > hiC && c[i - 1] <= hiC) { put(i, 1, loC - 0.1 * atr, c[i] + pole); break; }
+        if (-pole >= 3 * atr && hiC - loC <= 0.5 * -pole && loC >= l[j] - 0.3 * atr && c[i] < loC && c[i - 1] >= loC) { put(i, -1, hiC + 0.1 * atr, c[i] + pole); break; }
+      }
+    } else if (key === 'tri') {
+      if (PH.length >= 2 && PL.length >= 2) {
+        const H2 = PH[PH.length - 1], H1 = PH[PH.length - 2], L2 = PL[PL.length - 1], L1 = PL[PL.length - 2];
+        const span = Math.max(H2.k, L2.k) - Math.min(H1.k, L1.k);
+        if (span >= 10 && span <= 60 && i - Math.max(H2.k, L2.k) <= 30) {
+          const res = Math.max(H1.p, H2.p), sup = Math.min(L1.p, L2.p);
+          if (Math.abs(H1.p - H2.p) <= 0.3 * atr && L2.p > L1.p + 0.2 * atr && c[i] > res && c[i - 1] <= res) put(i, 1, L2.p - 0.1 * atr, c[i] + (res - L1.p));
+          else if (Math.abs(L1.p - L2.p) <= 0.3 * atr && H2.p < H1.p - 0.2 * atr && c[i] < sup && c[i - 1] >= sup) put(i, -1, H2.p + 0.1 * atr, c[i] - (H1.p - sup));
+        }
+      }
+    }
+  }
+  return { sig: sig, sl: slA, tp: tpA };
+}
+
+function runPatternTest() {
+  if (!CAP_ON) return Promise.reject(new Error('Capital.com keys are missing.'));
+  const errors = [], all = PAT_CANDLE.concat(PAT_CHART);
+  const acc = {}, ctl = {}, per = {}, rows = {};
+  all.forEach(function (p) { acc[p[0]] = [stNewAcc(), stNewAcc(), stNewAcc()]; ctl[p[0]] = [stNewAcc(), stNewAcc(), stNewAcc()]; per[p[0]] = []; rows[p[0]] = []; });
+  let used = 0;
+  const addTo = function (dst, src) { for (let p = 0; p < 3; p++) { dst[p].n += src[p].n; dst[p].w += src[p].w; dst[p].sumR += src[p].sumR; dst[p].gp += src[p].gp; dst[p].gl += src[p].gl; } };
+  return ST_MARKETS.reduce(function (chain, sym) {
+    return chain.then(function () {
+      return stFetchHistory(sym, STRAT_PAGES, errors).then(function (b) {
+        if (b.length < 1000) { errors.push(sym + ': only ' + b.length + ' bars'); return null; }
+        used++;
+        const D = stBuild(b);
+        const split = [Math.floor(D.n * 0.5), Math.floor(D.n * 0.75)];
+        const rsig = stSignals('rand', D, 777 + sym.length);
+        PAT_CANDLE.forEach(function (p) {
+          const sig = patCandle(D, p[0]);
+          const a = [stNewAcc(), stNewAcc(), stNewAcc()], c = [stNewAcc(), stNewAcc(), stNewAcc()];
+          stSim(D, sig, ST_VARIANTS[0], split, a, { overlap: 0, wideSpread: 0, noAtr: 0 }, rows[p[0]], null, sym, p[0]);
+          // control: random entries with the same number of trades and same stop and target rule
+          const cs = new Int8Array(D.n), R = { s: 31 + sym.length };
+          let cnt = 0; for (let i = 0; i < D.n; i++) if (sig[i] !== 0) cnt++;
+          for (let q = 0; q < cnt; q++) cs[ST_WARM + Math.floor(evoRand(R) * (D.n - ST_WARM - 4))] = evoRand(R) < 0.5 ? 1 : -1;
+          stSim(D, cs, ST_VARIANTS[0], split, c, { overlap: 0, wideSpread: 0, noAtr: 0 }, null, null, sym, 'ctl');
+          addTo(acc[p[0]], a); addTo(ctl[p[0]], c); per[p[0]].push(a[2]);
+        });
+        PAT_CHART.forEach(function (p, pi) {
+          const S = patChart(D, p[0]);
+          const a = [stNewAcc(), stNewAcc(), stNewAcc()], c = [stNewAcc(), stNewAcc(), stNewAcc()];
+          stSimLv(D, S, split, a, rows[p[0]], sym, p[0]);
+          stSimLv(D, stSmcControl(D, S, 9100 + pi * 17 + sym.length), split, c, null, sym, 'ctl');
+          addTo(acc[p[0]], a); addTo(ctl[p[0]], c); per[p[0]].push(a[2]);
+        });
+        return new Promise(function (r) { setImmediate(r); });
+      });
+    });
+  }, Promise.resolve()).then(function () {
+    if (!used) throw new Error('No history could be loaded. ' + (errors[0] || ''));
+    const msgs = [['📐 *' + md('Pattern test') + '*',
+      md(used + ' markets, hourly. Candlestick patterns (against a trend, stop 1.5x ATR, target 2x) and chart patterns (neckline or boundary break, stop beyond the pattern, measured-move target, reward at least ' + SMC_MIN_RR + 'x risk, 0.9x for double tops and bottoms). Real spread + ' + STRAT_SLIP + 'x slippage, same train / validation / out-of-sample split.'),
+      md('Control = random entries, same number of trades and same stop and target rule.')].join('\n')];
+    const lines = [];
+    const pass = [];
+    all.forEach(function (p) {
+      const a = acc[p[0]], c = ctl[p[0]], exps = a.map(stExp);
+      const posM = per[p[0]].filter(function (x) { return stExp(x) > 0; }).length;
+      const t = evoTstat(rows[p[0]], 2);
+      let verdict;
+      if (a[0].n < 30 || a[1].n < 30 || a[2].n < 30) verdict = 'too few trades';
+      else if (exps[0] >= 0.05 && exps[1] >= 0.05 && exps[2] >= 0.05 && stPF(a[2]) >= 1.15 && t >= 2 && exps[2] - stExp(c[2]) >= 0.05 && posM >= Math.ceil(used * 2 / 3)) { verdict = 'PASS ✅'; pass.push(p[1]); }
+      else verdict = 'fail';
+      lines.push(md(p[1] + ': ' + stF(exps[0]) + ' | ' + stF(exps[1]) + ' | ' + stF(exps[2]) + 'R (n ' + a[0].n + '/' + a[1].n + '/' + a[2].n + '), OOS PF ' + stPF(a[2]).toFixed(2) + ', win ' + (a[2].n ? Math.round(100 * a[2].w / a[2].n) : 0) + '%, ' + posM + '/' + used + ' markets +, control ' + stF(stExp(c[2])) + ' -> ' + verdict));
+    });
+    msgs.push(['*' + md('Net R per trade: train | validation | out-of-sample') + '*'].concat(lines).join('\n'));
+    msgs.push(pass.length
+      ? '*' + md('Passed: ' + pass.join(', ') + '. One test period, so treat it as a lead and confirm on new data before any live use. Tell me and I will wire it to the demo trading.') + '*'
+      : '*' + md('Verdict: no pattern passed every check. None of these are enabled, and none are worth trading on this evidence.') + '*');
+    return { msgs: msgs };
+  });
+}
+
 // ---------- Restart safety and emergency stop ----------
 // After a restart the bot forgets its open trades. This reads the open positions from Capital.com
 // and adopts them again, so wins and losses are still recorded and the time limit still applies.
@@ -74,348 +213,126 @@ function mirrorSync() {
   }, Promise.resolve());
 }
 
-function sendLong(text) {
-  if (text.length <= 3800) return sendTelegram(text);
-  const lines = text.split('\n');
-  let chunk = '', chain = Promise.resolve();
-  lines.forEach(function (ln) {
-    if ((chunk + '\n' + ln).length > 3800) { const c = chunk; chain = chain.then(function () { return sendTelegram(c); }); chunk = ln; }
-    else chunk = chunk ? chunk + '\n' + ln : ln;
-  });
-  return chain.then(function () { return sendTelegram(chunk); });
+// ---------- Forward tracker: paper-record every strategy signal on new prices ----------
+// No orders are placed. Every hour the bot looks at the last completed hourly candle on 6 markets,
+// writes down a pretend trade for each strategy that fires (15 strategies, 4 candlestick patterns,
+// 4 chart patterns, 2 structure strategies), then follows each one to its stop, target or the
+// 48-hour limit using real prices and the same costs as the tests. Each pretend trade is tagged
+// volatile or not, so we can see whether volatile hours really are better.
+// Records are saved in Supabase table forward_signals if it exists (see the SQL in the chat),
+// otherwise they live in memory and are lost when Render restarts.
+
+let fwOn = process.env.FORWARD !== 'off';
+let fwRecs = [];
+let fwSeen = {};
+let fwLastHour = 0;
+let fwLastWeek = '';
+let fwDbOk = true;
+const FW_MAX_CLOSED = 20000;
+const FW_NAMES = (function () {
+  const o = {};
+  ST_STRATS.forEach(function (s) { if (s[0] !== 'rand') o[s[0]] = s[1]; });
+  PAT_CANDLE.forEach(function (p) { o['c_' + p[0]] = p[1]; });
+  PAT_CHART.forEach(function (p) { o['p_' + p[0]] = p[1]; });
+  o.m_fvg = SMC_NAMES.fvg; o.m_struct = SMC_NAMES.struct;
+  return o;
+})();
+
+function fwDb(method, path, body) {
+  if (!DB_ON || !fwDbOk) return Promise.resolve(null);
+  return fetch(SUPABASE_URL + '/rest/v1/forward_signals' + path, {
+    method: method, headers: dbHeaders(), body: body ? JSON.stringify(body) : undefined,
+  }).then(function (r) {
+    if (!r.ok) return r.text().then(function (t) {
+      if (fwDbOk) { fwDbOk = false; console.error('Forward DB ' + r.status + ': ' + t.slice(0, 160) + ' (memory only until fixed)'); }
+      return null;
+    });
+    return method === 'GET' ? r.json() : true;
+  }).catch(function (e) { console.error('Forward DB failed: ' + e.message); return null; });
 }
 
-function handleTelegramCommand(text) {
-  const parts = String(text).trim().toLowerCase().split(/\s+/);
-  const cmd = parts[0].split('@')[0];
-  const arg = parts[1] || '';
-
-  if (cmd === '/start') {
-    if (botRunning) return sendTelegram('⚠️ Already running\\. Use /status');
-    startBot(true);
-    return Promise.resolve();
-  }
-  if (cmd === '/stop') {
-    stopBot();
-    return sendTelegram('⏸️ Stopped\\. ' + md(signalCount) + ' signals · ' + md(dailyWins) + 'W/' + md(dailyLosses) + 'L');
-  }
-  if (cmd === '/status') {
-    const s = getSession();
-    return sendTelegram(
-      '📊 *Status*\n\n' +
-      'Bot: ' + (botRunning ? '🟢 Running' : '🔴 Stopped') + '\n' +
-      'Auto\\-trading: ' + (autoTrade ? '🤖 ON' : '✋ OFF') + '\n' +
-      'Broker: ' + md(tradeBroker) + '\n' +
-      (circuitOpen ? '🛑 Paused: ' + md(circuitReason) + '\n' : '') +
-      'Open trades: ' + md(pendingTrades.length) + '\n' +
-      'Signals: ' + md(signalCount) + '\n' +
-      'Wins: ' + md(dailyWins) + ' · Losses: ' + md(dailyLosses) + '\n' +
-      s.emoji + ' ' + md(s.message) + '\n' +
-      'Time: ' + md(lusakaTime()) + ' CAT'
-    );
-  }
-  if (cmd === '/auto') {
-    if (arg === 'on') { autoTrade = true; return sendTelegram('🤖 Auto\\-trading *ON* \\(' + md(isDemoAccount() ? 'demo' : 'REAL account') + '\\)'); }
-    if (arg === 'off') { autoTrade = false; return sendTelegram('✋ Auto\\-trading *OFF*\\. Manual signals only\\.'); }
-    return sendTelegram('Use /auto on or /auto off');
-  }
-  if (cmd === '/deeptest') {
-    if (deepRunning) return sendTelegram('⏳ Deep test is already running\\.');
-    deepRunning = true;
-    return sendTelegram('⏳ Deep test started\\. It takes about 5 to 8 minutes\\. I will message you when done\\.').then(function () {
-      return runDeepTest();
-    }).then(function (txt) {
-      deepRunning = false;
-      return sendTelegram(txt);
-    }).catch(function (e) {
-      deepRunning = false;
-      return sendTelegram('❌ Deep test failed: ' + md(e.message));
-    });
-  }
-  if (cmd === '/backtest') {
-    if (backtesting) return sendTelegram('⏳ Backtest is already running\\.');
-    backtesting = true;
-    return sendTelegram('⏳ Backtest started\\. This takes about a minute\\.').then(function () {
-      return runBacktest();
-    }).then(function (txt) {
-      backtesting = false;
-      return sendTelegram(txt);
-    }).catch(function (e) {
-      backtesting = false;
-      return sendTelegram('❌ Backtest failed: ' + md(e.message));
-    });
-  }
-  if (cmd === '/resume') {
-    circuitOpen = false; circuitNotified = false; consecLosses = 0; dayPnl = 0;
-    return sendTelegram('▶️ Auto\\-trading resumed\\.');
-  }
-  if (cmd === '/limit') {
-    const n = parseInt(arg, 10);
-    if (!(n >= 1 && n <= 200)) return sendTelegram('🛑 Daily limit: ' + md(maxTradesPerDay) + ' trades \(' + md(tradesToday) + ' today\)\nUse /limit 40');
-    maxTradesPerDay = n;
-    limitNotifiedDay = '';
-    return sendTelegram('🛑 Daily limit set to *' + md(n) + ' trades*\.');
-  }
-  if (cmd === '/duration') {
-    const m = parseInt(arg, 10);
-    if ([1, 2, 3, 5, 10, 15, 30].indexOf(m) === -1) {
-      return sendTelegram('⏱ Trade length: ' + md(durationMin) + ' min\nUse /duration 1, 2, 3, 5, 10, 15 or 30');
-    }
-    durationMin = m;
-    return sendTelegram('⏱ Trade length set to *' + md(m) + ' min*\. Resets to ' + md(process.env.DURATION_MIN || 15) + ' min if Render restarts\.');
-  }
-  if (cmd === '/newstrade') {
-    if (arg === 'on' || arg === 'off') newsTrade = arg === 'on';
-    return sendTelegram(md(ntReport()) + '\n\nUse /newstrade on or off\\.');
-  }
-  if (cmd === '/news') {
-    if (arg === 'on' || arg === 'off') {
-      newsOn = arg === 'on';
-      return (newsOn ? loadNews() : Promise.resolve()).then(function () {
-        return sendTelegram('📰 News filter *' + md(arg.toUpperCase()) + '*');
+function fwLoad() {
+  if (!DB_ON) return Promise.resolve();
+  const h = dbHeaders();
+  return fetch(SUPABASE_URL + '/rest/v1/forward_signals?select=*&order=ts.desc&limit=20000', { headers: h })
+    .then(function (r) {
+      if (!r.ok) { fwDbOk = false; return null; }
+      return r.json();
+    }).then(function (rows) {
+      if (!Array.isArray(rows)) return;
+      fwRecs = rows.map(function (x) {
+        return { id: x.id, k: x.k, m: x.m, vol: !!x.vol, s: Number(x.s), ts: Number(x.ts), te: Number(x.te), entry: Number(x.entry), stop: Number(x.stop), tgt: Number(x.tgt), st: x.st, r: x.r === null ? null : Number(x.r), tc: x.tc ? Number(x.tc) : 0 };
       });
-    }
-    return ensureNews().then(function () { return sendTelegram(md(newsReport())); });
-  }
-  if (cmd === '/patterntest') {
-    if (patRunning || smcRunning || evoRunning || stratRunning || volRunning) return sendTelegram('⏳ A test is already running\\.');
-    patRunning = true;
-    return sendTelegram('⏳ Pattern test started: candlestick and chart patterns\\. About 3 to 6 minutes\\.').then(function () {
-      return runPatternTest();
-    }).then(function (res) {
-      patRunning = false;
-      return res.msgs.reduce(function (chain, m) { return chain.then(function () { return sendLong(m); }); }, Promise.resolve());
-    }).catch(function (e) {
-      patRunning = false;
-      return sendTelegram('❌ Pattern test failed: ' + md(e.message));
-    });
-  }
-  if (cmd === '/mirror') {
-    if (arg === 'on' || arg === 'off') mirrorOn = arg === 'on';
-    return sendTelegram('🪞 Mirror to Deriv: *' + md(mirrorOn ? 'ON' : 'OFF') + '*\\. Copies each Capital\\.com forex and metals trade on Deriv as a Rise/Fall contract\\. Use /mirror on or /mirror off\\.');
-  }
-  if (cmd === '/panic') {
-    return panicStop();
-  }
-  if (cmd === '/smc') {
-    if (arg === 'on' || arg === 'off') smcOn = arg === 'on';
-    return sendTelegram(md(smcReport()));
-  }
-  if (cmd === '/smctest') {
-    if (smcRunning || evoRunning || stratRunning || volRunning) return sendTelegram('⏳ A test is already running\\.');
-    smcRunning = true;
-    return sendTelegram('⏳ Market\\-structure test started \\(BOS, FVG, pullback entries\\)\\. About 3 to 6 minutes\\.').then(function () {
-      return runSmcTest();
-    }).then(function (res) {
-      smcRunning = false;
-      return res.msgs.reduce(function (chain, m) { return chain.then(function () { return sendLong(m); }); }, Promise.resolve());
-    }).catch(function (e) {
-      smcRunning = false;
-      return sendTelegram('❌ Market\\-structure test failed: ' + md(e.message));
-    });
-  }
-  if (cmd === '/evolved') {
-    if (arg === 'on' || arg === 'off') evoOn = arg === 'on';
-    return sendTelegram(md(evoReport()));
-  }
-  if (cmd === '/strategysearch') {
-    if (evoRunning || stratRunning || volRunning) return sendTelegram('⏳ A test is already running\\.');
-    evoRunning = true;
-    return sendTelegram('⏳ Strategy search started: the bot is building and testing its own rules\\. About 5 to 10 minutes\\.').then(function () {
-      return runStrategySearch();
-    }).then(function (res) {
-      evoRunning = false;
-      return res.msgs.reduce(function (chain, m) { return chain.then(function () { return sendLong(m); }); }, Promise.resolve());
-    }).catch(function (e) {
-      evoRunning = false;
-      return sendTelegram('❌ Strategy search failed: ' + md(e.message));
-    });
-  }
-  if (cmd === '/volatile') {
-    if (arg === 'on' || arg === 'off') volatileMode = arg === 'on';
-    return sendTelegram(md(volReport()));
-  }
-  if (cmd === '/volatiletest') {
-    if (volRunning || stratRunning) return sendTelegram('⏳ A test is already running\\.');
-    volRunning = true;
-    return sendTelegram('⏳ Volatile\\-market test started\\. About 3 to 6 minutes\\.').then(function () {
-      return runVolatileTest();
-    }).then(function (res) {
-      volRunning = false;
-      return res.msgs.reduce(function (chain, m) { return chain.then(function () { return sendLong(m); }); }, Promise.resolve());
-    }).catch(function (e) {
-      volRunning = false;
-      return sendTelegram('❌ Volatile test failed: ' + md(e.message));
-    });
-  }
-  if (cmd === '/strategytest') {
-    if (stratRunning) return sendTelegram('⏳ Strategy test is already running\\.');
-    stratRunning = true;
-    return sendTelegram('⏳ Strategy test started: 16 modules on hourly Capital\\.com candles\\. It takes about 3 to 6 minutes\\. I will message you when it is done\\.').then(function () {
-      return runStrategyTest();
-    }).then(function (res) {
-      stratRunning = false;
-      return res.msgs.reduce(function (chain, m) { return chain.then(function () { return sendLong(m); }); }, Promise.resolve()).then(function () { return stSendCsv(res.rows); });
-    }).catch(function (e) {
-      stratRunning = false;
-      return sendTelegram('❌ Strategy test failed: ' + md(e.message));
-    });
-  }
-  if (cmd === '/capital') {
-    return capitalDiag().then(function (t) { return sendTelegram(md(t)); })
-      .catch(function (e) { return sendTelegram('❌ ' + md(e.message)); });
-  }
-  if (cmd === '/broker') {
-    if (arg === 'capital' || arg === 'deriv' || arg === 'both') {
-      if (arg !== 'deriv' && !CAP_ON) return sendTelegram('❌ Capital\\.com keys are missing in Render\\.');
-      tradeBroker = arg;
-      return sendTelegram('🔀 Trading broker: *' + md(arg) + '*' + (arg === 'capital' ? md(' (Capital demo: forex, metals, indices, oil, crypto)') : arg === 'both' ? md(' (Capital demo for forex, metals, indices, oil, crypto + Deriv for volatility indices)') : md(' (Deriv, all its markets)')) + '\\. Resets if Render restarts unless TRADE_BROKER is set\\.');
-    }
-    return sendTelegram('Broker now: ' + md(tradeBroker) + '\nUse /broker capital, /broker deriv or /broker both');
-  }
-  if (cmd === '/risk') {
-    const v = Number(arg);
-    if (!(v >= 0.5 && v <= 50)) return sendTelegram('💵 Capital risk per trade: $' + md(capRisk) + '\nUse /risk 3 \\(between 0\\.5 and 50\\)');
-    capRisk = v;
-    return sendTelegram('💵 Risk per trade set to *$' + md(v) + '*');
-  }
-  if (cmd === '/learn') {
-    return learn().then(function () {
-      return sendTelegram('🧠 *Learning*\n\n' + md(lastLearnInfo) + '\n\nStorage: ' + md(DB_ON ? 'Supabase' : 'memory only'));
-    });
-  }
-  if (cmd === '/win') { dailyWins++; return sendTelegram('✅ Win recorded: ' + md(dailyWins) + 'W/' + md(dailyLosses) + 'L'); }
-  if (cmd === '/loss') { dailyLosses++; return sendTelegram('❌ Loss recorded: ' + md(dailyWins) + 'W/' + md(dailyLosses) + 'L'); }
-  if (cmd === '/balance') {
-    return derivBalance()
-      .then(function (b) { return sendTelegram('💰 Balance: ' + md(b)); })
-      .catch(function (e) { return sendTelegram('❌ ' + md(e.message)); });
-  }
-  if (cmd === '/accounts') {
-    return listAccounts()
-      .then(function (j) { return sendTelegram('🧾 ' + md(JSON.stringify(j).slice(0, 900))); })
-      .catch(function (e) { return sendTelegram('❌ ' + md(e.message.slice(0, 600))); });
-  }
-  return Promise.resolve();
+      fwRecs.forEach(function (x) { fwSeen[x.id] = true; });
+      console.log('Forward tracker: loaded ' + fwRecs.length + ' records');
+    }).catch(function () { fwDbOk = false; });
 }
 
-// ---------- HTTP ----------
-
-function send(res, code, obj) {
-  res.writeHead(code, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify(obj));
+function fwBars(symbol) {
+  return capEpic(symbol).then(function (epic) { return capCall('GET', '/prices/' + epic + '?resolution=HOUR&max=500'); }).then(function (j) {
+    const m = function (o) { return (Number(o.bid) + Number(o.ask)) / 2; };
+    return (j.prices || []).map(function (x) {
+      return { t: Date.parse((x.snapshotTimeUTC || x.snapshotTime) + 'Z'), o: m(x.openPrice), h: m(x.highPrice), l: m(x.lowPrice), c: m(x.closePrice), sp: Math.abs(Number(x.openPrice.ask) - Number(x.openPrice.bid)) };
+    }).filter(function (b) { return !isNaN(b.t) && b.h > 0; }).sort(function (a, b) { return a.t - b.t; });
+  });
 }
 
-const server = http.createServer(function (req, res) {
-  // Keep-alive ping (no secret needed). Point a free pinger here every 10 minutes.
-  if (req.method === 'GET') {
-    send(res, 200, { ok: true, running: botRunning, time: new Date().toISOString() });
-    return;
+// follow one open record on the latest completed bars
+function fwResolve(rec, D) {
+  const last = D.n - 2;                       // last completed bar
+  let e = -1;
+  for (let i = D.n - 1; i >= 0; i--) { if (D.bars[i].t === rec.te) { e = i; break; } if (D.bars[i].t < rec.te) break; }
+  if (e < 0) { if (Date.now() - rec.te > 72 * 3600000) { rec.st = 'expired'; rec.tc = Date.now(); return true; } return false; }
+  const s = rec.s, entry = rec.entry, stop = rec.stop, target = rec.tgt;
+  const dist = s > 0 ? entry - stop : stop - entry;
+  const reach = s > 0 ? target - entry : entry - target;
+  if (!(dist > 0) || !(reach > 0)) { rec.st = 'expired'; rec.tc = Date.now(); return true; }
+  const rr = reach / dist;
+  const maxJ = Math.min(e + ST_MAXHOLD, last);
+  let R = null, j = e;
+  for (; j <= maxJ; j++) {
+    if (s > 0) {
+      if (j > e && D.o[j] <= stop) { R = (D.o[j] - entry) / dist; break; }
+      if (D.l[j] <= stop) { R = -1; break; }
+      if (D.h[j] >= target) { R = rr; break; }
+    } else {
+      if (j > e && D.o[j] >= stop) { R = (entry - D.o[j]) / dist; break; }
+      if (D.h[j] >= stop) { R = -1; break; }
+      if (D.l[j] <= target) { R = rr; break; }
+    }
   }
+  if (R === null) {
+    if (e + ST_MAXHOLD <= last) { j = e + ST_MAXHOLD; R = ((D.c[j] - entry) * s) / dist; }
+    else return false;                        // still open
+  }
+  rec.r = R - (D.sp[e] * (1 + STRAT_SLIP)) / dist;
+  rec.st = 'closed';
+  rec.tc = Date.now();
+  return true;
+}
 
-  let body = '';
-  req.on('data', function (c) { body += c; });
-  req.on('end', function () {
-    let p;
-    try { p = JSON.parse(body); }
-    catch (e) { send(res, 400, { ok: false, error: 'Invalid JSON' }); return; }
-
-    // Telegram webhook: only your own chat is allowed
-    if (req.url && req.url.indexOf('/telegram') === 0) {
-      const m = p.message;
-      send(res, 200, { ok: true });
-      if (m && m.text && m.chat && String(m.chat.id) === String(TELEGRAM_CHAT_ID)) {
-        handleTelegramCommand(m.text).catch(function (e) { console.error('Command error: ' + e.message); });
-      }
-      return;
-    }
-
-    // Everything else needs the bridge secret
-    if (req.headers['x-bridge-secret'] !== BRIDGE_SECRET) {
-      send(res, 401, { ok: false, error: 'Unauthorized' });
-      return;
-    }
-
-    console.log('[' + new Date().toISOString() + '] ' + p.cmd + ' ' + (p.symbol || ''));
-
-    if (p.cmd === 'ANALYZE') {
-      const derivSym = SYMBOL_MAP[p.symbol];
-      if (!derivSym) { send(res, 400, { ok: false, error: 'Unknown symbol' }); return; }
-      fetchCandles(derivSym, 80).then(function (prices) {
-        send(res, 200, { ok: true, symbol: p.symbol, analysis: analyze(prices) });
-      }).catch(function (err) {
-        send(res, 200, { ok: false, symbol: p.symbol, error: err.message });
-      });
-      return;
-    }
-
-    if (p.cmd === 'ACCOUNTS') {
-      listAccounts().then(function (j) { send(res, 200, { ok: true, accounts: j }); })
-        .catch(function (err) { send(res, 200, { ok: false, error: err.message }); });
-      return;
-    }
-
-    if (p.cmd === 'BALANCE') {
-      derivBalance().then(function (b) { send(res, 200, { ok: true, balance: b }); })
-        .catch(function (err) { send(res, 200, { ok: false, error: err.message }); });
-      return;
-    }
-
-    if (p.cmd === 'BUY') {
-      placeTrade(p.symbol, p.action, p.stake).then(function (t) { send(res, 200, { ok: true, trade: t }); })
-        .catch(function (err) { send(res, 200, { ok: false, error: err.message }); });
-      return;
-    }
-
-    if (p.cmd === 'CHECK') {
-      checkContract(p.contract_id).then(function (r) { send(res, 200, { ok: true, result: r }); })
-        .catch(function (err) { send(res, 200, { ok: false, error: err.message }); });
-      return;
-    }
-
-    // Dashboard controls
-    if (p.cmd === 'BOT_STATUS') { send(res, 200, Object.assign({ ok: true }, botStatus())); return; }
-    if (p.cmd === 'BOT_START') {
-      const started = startBot(true);
-      send(res, 200, { ok: true, success: started, message: started ? 'Started' : 'Already running' });
-      return;
-    }
-    if (p.cmd === 'BOT_STOP') {
-      const stopped = stopBot();
-      if (stopped) sendTelegram('⏸️ Stopped\\. ' + md(signalCount) + ' signals · ' + md(dailyWins) + 'W/' + md(dailyLosses) + 'L');
-      send(res, 200, { ok: true, success: stopped, signalCount: signalCount, dailyWins: dailyWins, dailyLosses: dailyLosses });
-      return;
-    }
-    if (p.cmd === 'BOT_TEST') {
-      const pair = availablePairs()[0] || PAIRS[0];
-      analyseSymbol(pair.symbol).then(function (a) {
-        if (!a) { send(res, 200, { ok: false, error: 'Deriv feed unreachable' }); return null; }
-        return sendTelegram(
-          '🔔 *Test — ' + md(pair.display) + '*\n\n' +
-          'Action: *' + md(a.action) + '*\n' +
-          'Price: ' + md(a.price.toFixed(pair.decimals)) + '\n' +
-          'RSI: ' + md(a.rsi.toFixed(1)) + '\n' +
-          'Reason: ' + md(a.reason) + '\n\n' +
-          '✅ Live Deriv feed working\\!'
-        ).then(function (ok) {
-          send(res, 200, { ok: true, success: ok, signal: { symbol: pair.display, action: a.action, rsi: a.rsi } });
-        });
-      });
-      return;
-    }
-
-    send(res, 400, { ok: false, error: 'Unknown command: ' + p.cmd });
+function fwNewSignals(sym, D, bars) {
+  const i = D.n - 2, e = D.n - 1;
+  const out = [];
+  if (!(D.atr[i] > 0) || (D.medSp > 0 && D.sp[e] > 3 * D.medSp)) return out;
+  const vol = stIsVol(D, i, 1.5);
+  const add = function (k, s, stop, tgt) {
+    const id = k + ':' + sym + ':' + bars[i].t;
+    if (fwSeen[id] || s === 0) return;
+    const entry = D.o[e];
+    const ok = s > 0 ? (entry > stop && tgt > entry) : (entry < stop && tgt < entry);
+    if (!ok) return;
+    out.push({ id: id, k: k, m: sym, vol: vol, s: s, ts: bars[i].t, te: bars[e].t, entry: entry, stop: stop, tgt: tgt, st: 'open', r: null, tc: 0 });
+  };
+  const atr = D.atr[i];
+  const atrExit = function (k, s) { if (s !== 0) add(k, s, D.o[e] - s * 1.5 * atr, D.o[e] + s * 3 * atr); };
+  ST_STRATS.forEach(function (st) {
+    if (st[0] === 'rand') return;
+    try { atrExit(st[0], stSignals(st[0], D, 1)[i]); } catch (err) { /* skip */ }
   });
-});
+  PAT_CANDLE.forEach(function (p) { try { atrExit('c_' + p[0], patCandle(D, p[0])[i]); } catch (err) { /* skip */ } });
+  PAT_CHART.forEach(function (p) { try { const S = patChart(D, p[0]); if (S.sig[i]) add('p_' + p[0], S.sig[i], S.sl[i], S.tp[i]); } catch (err) { /* skip */ } });
+  ['fvg', 'struct'].forEach(function (k) { try { const S = stSmcSignals(D, k); if (S.sig[i]) add('m_' + k, S.sig[i], S.sl[i], S.tp[i]); } catch (err) { /* skip */ } });
+  return out;
+}
 
-server.listen(PORT, function () {
-  console.log('ForexPulse Bridge on port ' + PORT);
-  console.log('App ID set: ' + (DERIV_APP_ID ? 'yes' : 'NO') + ' | Token set: ' + (DERIV_API_TOKEN ? 'yes' : 'NO') +
-    ' | Telegram set: ' + (TELEGRAM_TOKEN && TELEGRAM_CHAT_ID ? 'yes' : 'NO') +
-    ' | Auto-trade: ' + autoTrade + ' | Demo account: ' + isDemoAccount());
-  // Restart-proof: Render restarts the server now and then, so resume by itself
-  console.log('Trade log: ' + (DB_ON ? 'Supabase' : 'memory only (set SUPABASE_URL and SUPABASE_KEY)'));
-  learn().then(capReconcile).then(function () {
-    if (process.env.BOT_AUTOSTART === 'true') startBot(true);
-  });
-});
