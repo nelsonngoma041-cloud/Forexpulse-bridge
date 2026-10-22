@@ -1,3 +1,50 @@
+function maybeEvolvedTrade() {
+  if (!evoOn || !evoWinners.length || !autoTrade || !CAP_ON || tradeBroker === 'deriv' || circuitOpen) return Promise.resolve();
+  const now = new Date();
+  if (now.getUTCMinutes() < 1 || now.getUTCMinutes() > 20) return Promise.resolve();   // act just after the hour closes
+  const hourId = Math.floor(now.getTime() / 3600000);
+  return ST_MARKETS.reduce(function (chain, sym) {
+    return chain.then(function () {
+      const key = sym + ':' + hourId;
+      if (evoSeen[key]) return null;
+      evoSeen[key] = true;
+      const pair = PAIRS.filter(function (p) { return p.symbol === sym; })[0];
+      if (!pair || pendingTrades.some(function (t) { return t.display === pair.display; }) || openCount() >= 6) return null;
+      if (newsBlock(sym)) return null;
+      return evoLiveBars(sym).then(function (bars) {
+        if (bars.length < 260) return null;
+        const D = stBuild(bars);
+        const i = D.n - 2;   // last completed hour
+        if (Date.now() - bars[i].t > 2.5 * 3600000) return null;   // stale data
+        if (D.medSp > 0 && D.sp[D.n - 1] > 3 * D.medSp) return null;
+        let hit = null, dir = 0;
+        for (let q = 0; q < evoWinners.length && !hit; q++) {
+          const s = evoSignalAt(D, evoWinners[q], i);
+          if (s !== 0) { hit = evoWinners[q]; dir = s; }
+        }
+        if (!hit || !(D.atr[i] > 0)) return null;
+        const action = dir > 0 ? 'BUY' : 'SELL';
+        return capitalTrade(sym, action, { sl: EVO_SL * D.atr[i], rr: EVO_RR }).then(function (t) {
+          tradesToday++;
+          pendingTrades.push({
+            contractId: t.dealId, display: pair.display, symbol: sym, action: action,
+            placedAt: Date.now(), votes: {}, minutes: EVO_HOLD_MIN, holdMin: EVO_HOLD_MIN, broker: 'capital', evoId: hit.id,
+          });
+          dbInsertTrade({
+            contract_id: String(t.dealId), symbol: sym, action: action, confidence: 0, votes: {}, rsi: 0,
+            hour: lusakaHour(), stake: Number(t.riskUsd.toFixed(2)), demo: true,
+          });
+          return sendTelegram(
+            '🧬 *EVOLVED TRADE — ' + md(pair.display) + '* \\(Capital demo\\)\n\n' +
+            md(hit.name) + '\n' + md(action) + ' · size ' + md(t.size) + ' · risk about $' + md(t.riskUsd.toFixed(2)) + '\n' +
+            'Stop loss: ' + md(t.sl.toPrecision(4)) + ' away · Take profit: ' + md(t.tp.toPrecision(4)) + ' away'
+          );
+        });
+      }).catch(function (e) { console.log('Evolved ' + sym + ': ' + e.message); return null; });
+    });
+  }, Promise.resolve());
+}
+
 // ---------- Market-structure ("smart money") strategies from the videos ----------
 // Swing highs and lows are confirmed 3 bars late, so nothing looks into the future.
 //  BOS = a close beyond the last swing high (up) or swing low (down).
@@ -294,143 +341,4 @@ function patCandle(D, key) {
   return sig;
 }
 function ema50At(D, i) { return D.ema50[i]; }
-
-function patChart(D, key) {
-  const n = D.n, h = D.h, l = D.l, c = D.c;
-  const sig = new Int8Array(n), slA = new Float64Array(n), tpA = new Float64Array(n);
-  const PH = [], PL = [];
-  let cool = 0;
-  const put = function (i, s, stop, tgt, minRR) {
-    const risk = s > 0 ? c[i] - stop : stop - c[i];
-    const reward = s > 0 ? tgt - c[i] : c[i] - tgt;
-    if (risk > 0 && reward / risk >= (minRR || SMC_MIN_RR) && i >= cool) { sig[i] = s; slA[i] = stop; tpA[i] = tgt; cool = i + 6; }
-  };
-  const minLow = function (a, b) { let m = Infinity; for (let t = a; t <= b; t++) if (l[t] < m) m = l[t]; return m; };
-  const maxHigh = function (a, b) { let m = -Infinity; for (let t = a; t <= b; t++) if (h[t] > m) m = h[t]; return m; };
-  const used = {};
-  for (let i = 60; i < n; i++) {
-    const k = i - 3;
-    let isH = true, isL = true;
-    for (let j = 1; j <= 3; j++) {
-      if (!(h[k] > h[k - j]) || !(h[k] >= h[k + j])) isH = false;
-      if (!(l[k] < l[k - j]) || !(l[k] <= l[k + j])) isL = false;
-    }
-    if (isH) PH.push({ k: k, p: h[k] });
-    if (isL) PL.push({ k: k, p: l[k] });
-    const atr = D.atr[i];
-    if (!(atr > 0)) continue;
-    if (key === 'dbl') {
-      if (PL.length >= 2) {
-        const L2 = PL[PL.length - 1], L1 = PL[PL.length - 2], id = 'b' + L1.k + '_' + L2.k;
-        if (!used[id] && Math.abs(L1.p - L2.p) <= 0.5 * atr && L2.k - L1.k >= 6 && L2.k - L1.k <= 60 && i - L2.k <= 40) {
-          const neck = maxHigh(L1.k, L2.k), low = Math.min(L1.p, L2.p);
-          if (neck - low >= 2 * atr && c[i] > neck && c[i - 1] <= neck) { used[id] = true; put(i, 1, low - 0.1 * atr, neck + (neck - low), 0.9); }
-        }
-      }
-      if (PH.length >= 2) {
-        const H2 = PH[PH.length - 1], H1 = PH[PH.length - 2], id = 't' + H1.k + '_' + H2.k;
-        if (!used[id] && Math.abs(H1.p - H2.p) <= 0.5 * atr && H2.k - H1.k >= 6 && H2.k - H1.k <= 60 && i - H2.k <= 40) {
-          const neck = minLow(H1.k, H2.k), hi = Math.max(H1.p, H2.p);
-          if (hi - neck >= 2 * atr && c[i] < neck && c[i - 1] >= neck) { used[id] = true; put(i, -1, hi + 0.1 * atr, neck - (hi - neck), 0.9); }
-        }
-      }
-    } else if (key === 'hs') {
-      if (PH.length >= 3) {
-        const P3 = PH[PH.length - 1], P2 = PH[PH.length - 2], P1 = PH[PH.length - 3], id = 'h' + P1.k + '_' + P3.k;
-        if (!used[id] && P2.p > P1.p && P2.p > P3.p && Math.abs(P1.p - P3.p) <= atr && P2.p - Math.max(P1.p, P3.p) >= atr && P3.k - P1.k <= 80 && i - P3.k <= 40) {
-          const neck = minLow(P1.k, P3.k);
-          if (c[i] < neck && c[i - 1] >= neck) { used[id] = true; put(i, -1, P3.p + 0.1 * atr, neck - (P2.p - neck)); }
-        }
-      }
-      if (PL.length >= 3) {
-        const P3 = PL[PL.length - 1], P2 = PL[PL.length - 2], P1 = PL[PL.length - 3], id = 'i' + P1.k + '_' + P3.k;
-        if (!used[id] && P2.p < P1.p && P2.p < P3.p && Math.abs(P1.p - P3.p) <= atr && Math.min(P1.p, P3.p) - P2.p >= atr && P3.k - P1.k <= 80 && i - P3.k <= 40) {
-          const neck = maxHigh(P1.k, P3.k);
-          if (c[i] > neck && c[i - 1] <= neck) { used[id] = true; put(i, 1, P3.p - 0.1 * atr, neck + (neck - P2.p)); }
-        }
-      }
-    } else if (key === 'flag') {
-      for (let m = 5; m <= 12; m++) {
-        const j = i - m;
-        if (j < 10) break;
-        const pole = c[j] - c[j - 5];
-        const hiC = maxHigh(j + 1, i - 1), loC = minLow(j + 1, i - 1);
-        if (pole >= 3 * atr && hiC - loC <= 0.5 * pole && hiC <= h[j] + 0.3 * atr && c[i] > hiC && c[i - 1] <= hiC) { put(i, 1, loC - 0.1 * atr, c[i] + pole); break; }
-        if (-pole >= 3 * atr && hiC - loC <= 0.5 * -pole && loC >= l[j] - 0.3 * atr && c[i] < loC && c[i - 1] >= loC) { put(i, -1, hiC + 0.1 * atr, c[i] + pole); break; }
-      }
-    } else if (key === 'tri') {
-      if (PH.length >= 2 && PL.length >= 2) {
-        const H2 = PH[PH.length - 1], H1 = PH[PH.length - 2], L2 = PL[PL.length - 1], L1 = PL[PL.length - 2];
-        const span = Math.max(H2.k, L2.k) - Math.min(H1.k, L1.k);
-        if (span >= 10 && span <= 60 && i - Math.max(H2.k, L2.k) <= 30) {
-          const res = Math.max(H1.p, H2.p), sup = Math.min(L1.p, L2.p);
-          if (Math.abs(H1.p - H2.p) <= 0.3 * atr && L2.p > L1.p + 0.2 * atr && c[i] > res && c[i - 1] <= res) put(i, 1, L2.p - 0.1 * atr, c[i] + (res - L1.p));
-          else if (Math.abs(L1.p - L2.p) <= 0.3 * atr && H2.p < H1.p - 0.2 * atr && c[i] < sup && c[i - 1] >= sup) put(i, -1, H2.p + 0.1 * atr, c[i] - (H1.p - sup));
-        }
-      }
-    }
-  }
-  return { sig: sig, sl: slA, tp: tpA };
-}
-
-function runPatternTest() {
-  if (!CAP_ON) return Promise.reject(new Error('Capital.com keys are missing.'));
-  const errors = [], all = PAT_CANDLE.concat(PAT_CHART);
-  const acc = {}, ctl = {}, per = {}, rows = {};
-  all.forEach(function (p) { acc[p[0]] = [stNewAcc(), stNewAcc(), stNewAcc()]; ctl[p[0]] = [stNewAcc(), stNewAcc(), stNewAcc()]; per[p[0]] = []; rows[p[0]] = []; });
-  let used = 0;
-  const addTo = function (dst, src) { for (let p = 0; p < 3; p++) { dst[p].n += src[p].n; dst[p].w += src[p].w; dst[p].sumR += src[p].sumR; dst[p].gp += src[p].gp; dst[p].gl += src[p].gl; } };
-  return ST_MARKETS.reduce(function (chain, sym) {
-    return chain.then(function () {
-      return stFetchHistory(sym, STRAT_PAGES, errors).then(function (b) {
-        if (b.length < 1000) { errors.push(sym + ': only ' + b.length + ' bars'); return null; }
-        used++;
-        const D = stBuild(b);
-        const split = [Math.floor(D.n * 0.5), Math.floor(D.n * 0.75)];
-        const rsig = stSignals('rand', D, 777 + sym.length);
-        PAT_CANDLE.forEach(function (p) {
-          const sig = patCandle(D, p[0]);
-          const a = [stNewAcc(), stNewAcc(), stNewAcc()], c = [stNewAcc(), stNewAcc(), stNewAcc()];
-          stSim(D, sig, ST_VARIANTS[0], split, a, { overlap: 0, wideSpread: 0, noAtr: 0 }, rows[p[0]], null, sym, p[0]);
-          // control: random entries with the same number of trades and same stop and target rule
-          const cs = new Int8Array(D.n), R = { s: 31 + sym.length };
-          let cnt = 0; for (let i = 0; i < D.n; i++) if (sig[i] !== 0) cnt++;
-          for (let q = 0; q < cnt; q++) cs[ST_WARM + Math.floor(evoRand(R) * (D.n - ST_WARM - 4))] = evoRand(R) < 0.5 ? 1 : -1;
-          stSim(D, cs, ST_VARIANTS[0], split, c, { overlap: 0, wideSpread: 0, noAtr: 0 }, null, null, sym, 'ctl');
-          addTo(acc[p[0]], a); addTo(ctl[p[0]], c); per[p[0]].push(a[2]);
-        });
-        PAT_CHART.forEach(function (p, pi) {
-          const S = patChart(D, p[0]);
-          const a = [stNewAcc(), stNewAcc(), stNewAcc()], c = [stNewAcc(), stNewAcc(), stNewAcc()];
-          stSimLv(D, S, split, a, rows[p[0]], sym, p[0]);
-          stSimLv(D, stSmcControl(D, S, 9100 + pi * 17 + sym.length), split, c, null, sym, 'ctl');
-          addTo(acc[p[0]], a); addTo(ctl[p[0]], c); per[p[0]].push(a[2]);
-        });
-        return new Promise(function (r) { setImmediate(r); });
-      });
-    });
-  }, Promise.resolve()).then(function () {
-    if (!used) throw new Error('No history could be loaded. ' + (errors[0] || ''));
-    const msgs = [['📐 *' + md('Pattern test') + '*',
-      md(used + ' markets, hourly. Candlestick patterns (against a trend, stop 1.5x ATR, target 2x) and chart patterns (neckline or boundary break, stop beyond the pattern, measured-move target, reward at least ' + SMC_MIN_RR + 'x risk, 0.9x for double tops and bottoms). Real spread + ' + STRAT_SLIP + 'x slippage, same train / validation / out-of-sample split.'),
-      md('Control = random entries, same number of trades and same stop and target rule.')].join('\n')];
-    const lines = [];
-    const pass = [];
-    all.forEach(function (p) {
-      const a = acc[p[0]], c = ctl[p[0]], exps = a.map(stExp);
-      const posM = per[p[0]].filter(function (x) { return stExp(x) > 0; }).length;
-      const t = evoTstat(rows[p[0]], 2);
-      let verdict;
-      if (a[0].n < 30 || a[1].n < 30 || a[2].n < 30) verdict = 'too few trades';
-      else if (exps[0] >= 0.05 && exps[1] >= 0.05 && exps[2] >= 0.05 && stPF(a[2]) >= 1.15 && t >= 2 && exps[2] - stExp(c[2]) >= 0.05 && posM >= Math.ceil(used * 2 / 3)) { verdict = 'PASS ✅'; pass.push(p[1]); }
-      else verdict = 'fail';
-      lines.push(md(p[1] + ': ' + stF(exps[0]) + ' | ' + stF(exps[1]) + ' | ' + stF(exps[2]) + 'R (n ' + a[0].n + '/' + a[1].n + '/' + a[2].n + '), OOS PF ' + stPF(a[2]).toFixed(2) + ', win ' + (a[2].n ? Math.round(100 * a[2].w / a[2].n) : 0) + '%, ' + posM + '/' + used + ' markets +, control ' + stF(stExp(c[2])) + ' -> ' + verdict));
-    });
-    msgs.push(['*' + md('Net R per trade: train | validation | out-of-sample') + '*'].concat(lines).join('\n'));
-    msgs.push(pass.length
-      ? '*' + md('Passed: ' + pass.join(', ') + '. One test period, so treat it as a lead and confirm on new data before any live use. Tell me and I will wire it to the demo trading.') + '*'
-      : '*' + md('Verdict: no pattern passed every check. None of these are enabled, and none are worth trading on this evidence.') + '*');
-    return { msgs: msgs };
-  });
-}
 
