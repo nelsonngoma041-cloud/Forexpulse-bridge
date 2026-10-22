@@ -1,37 +1,3 @@
-    if (announce) {
-      const ch = [];
-      STRATEGIES.forEach(function (k) {
-        if (Math.abs(weights[k] - old[k]) >= 0.01) ch.push(STRAT_NAMES[k] + ' ' + old[k].toFixed(2) + ' to ' + weights[k].toFixed(2));
-      });
-      const pz = Object.keys(pausedPairs);
-      return sendTelegram('🧠 *Learned from that trade*\n' +
-        md(rows.length < MIN_LEARN_TRADES ? 'Only ' + rows.length + ' trades so far. Weights stay at 1.00 until ' + MIN_LEARN_TRADES + ' trades.' :
-          (ch.length ? 'Weights: ' + ch.join(', ') : 'No weight change.')) +
-        (pz.length ? '\n' + md('Paused markets: ' + pz.join(', ')) : ''));
-    }
-    return null;
-  }).catch(function (e) { console.error('Learn failed: ' + e.message); });
-}
-
-function recordResult(won, profit) {
-  const day = new Date().toISOString().slice(0, 10);
-  if (day !== pnlDay) { pnlDay = day; dayPnl = 0; consecLosses = 0; circuitOpen = false; circuitReason = ''; }
-  dayPnl += profit;
-  consecLosses = won ? 0 : consecLosses + 1;
-  if (!circuitOpen && consecLosses >= MAX_CONSEC_LOSSES) {
-    circuitOpen = true;
-    circuitReason = consecLosses + ' losses in a row';
-  } else if (!circuitOpen && dayPnl <= -MAX_DAILY_LOSS) {
-    circuitOpen = true;
-    circuitReason = 'lost $' + Math.abs(dayPnl).toFixed(2) + ' today';
-  }
-  if (circuitOpen && !circuitNotified) {
-    circuitNotified = true;
-    sendTelegram('🛑 *Auto\\-trading paused*: ' + md(circuitReason) + '\\.\nNo new trades until tomorrow, or send /resume\\.');
-  }
-}
-let circuitNotified = false;
-
 function checkPendingTrades() {
   const now = Date.now();
   const due = pendingTrades.filter(function (t) { return now - t.placedAt >= ((t.minutes || 15) + 0.5) * 60 * 1000; });
@@ -443,4 +409,42 @@ function dispatchSignalInner() {
         return sendTelegram('⚠️ Auto\\-trade blocked on ' + md(pair.display) + ': ' + md(e.message));
       });
     }
+
+    // ----- Manual signal -----
+    signalCount++;
+    lastSignalAt[pair.symbol] = Date.now();
+    record();
+    return sendTelegram([
+      emoji + ' *' + md(a.action) + ' — ' + md(pair.display) + '*',
+      pair.type === 'derived' ? '🎲 Derived Index' : '💱 Forex',
+      '',
+      'Price: ' + md(price),
+      'Trade: *' + direction + '* · ' + durationMin + ' min',
+      'Confidence: ' + md(a.confidence) + '%',
+      '',
+      'RSI: ' + md(a.rsi.toFixed(1)) + ' · MACD: ' + (a.macd > 0 ? 'Bullish' : 'Bearish'),
+      'Why: ' + md(a.reason),
+      '',
+      '💰 Stake: $' + md(STAKE),
+      '⏳ *Execute within 2–5 mins*',
+      '⚠️ Do NOT execute after 5 mins',
+      '',
+      session.emoji + ' ' + md(session.message),
+      '⏰ ' + md(time) + ' · 🤖 ForexPulse PRO',
+    ].join('\n')).then(function () {
+      setTimeout(function () {
+        if (!botRunning) return;
+        sendTelegram('⏰ *Execute now — ' + md(pair.display) + '*\n' + emoji + ' *' + direction + '* · ' + durationMin + ' min\n⚠️ Signal expires in 3 minutes');
+      }, 2 * 60 * 1000);
+    });
+    };
+    // Both brokers: one Capital.com trade and one Deriv trade per round, so neither starves the other
+    if (tradeBroker === 'both' && autoTrade) {
+      const capPick = valid.filter(function (r) { return r.pair.type !== 'derived'; })[0];
+      const derPick = valid.filter(function (r) { return r.pair.type === 'derived'; })[0];
+      return Promise.resolve(capPick ? place(capPick) : null).then(function () { return derPick ? place(derPick) : null; });
+    }
+    return place(valid[0]);
+  });
+}
 
