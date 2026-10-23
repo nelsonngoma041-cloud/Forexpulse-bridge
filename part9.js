@@ -220,6 +220,19 @@ function handleTelegramCommand(text) {
       return sendTelegram('❌ Market\\-structure test failed: ' + md(e.message));
     });
   }
+  if (cmd === '/poctest') {
+    if (pocRunning || smcRunning || evoRunning || stratRunning || volRunning) return sendTelegram('⏳ A test is already running\\.');
+    pocRunning = true;
+    return sendTelegram('⏳ Volume\\-profile PoC test started\\. About 3 to 6 minutes\\.').then(function () {
+      return runPocTest();
+    }).then(function (res) {
+      pocRunning = false;
+      return res.msgs.reduce(function (chain, m) { return chain.then(function () { return sendLong(m); }); }, Promise.resolve());
+    }).catch(function (e) {
+      pocRunning = false;
+      return sendTelegram('❌ PoC test failed: ' + md(e.message));
+    });
+  }
   if (cmd === '/evolved') {
     if (arg === 'on' || arg === 'off') evoOn = arg === 'on';
     return sendTelegram(md(evoReport()));
