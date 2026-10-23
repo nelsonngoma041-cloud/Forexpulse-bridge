@@ -1,81 +1,3 @@
-function patChart(D, key) {
-  const n = D.n, h = D.h, l = D.l, c = D.c;
-  const sig = new Int8Array(n), slA = new Float64Array(n), tpA = new Float64Array(n);
-  const PH = [], PL = [];
-  let cool = 0;
-  const put = function (i, s, stop, tgt, minRR) {
-    const risk = s > 0 ? c[i] - stop : stop - c[i];
-    const reward = s > 0 ? tgt - c[i] : c[i] - tgt;
-    if (risk > 0 && reward / risk >= (minRR || SMC_MIN_RR) && i >= cool) { sig[i] = s; slA[i] = stop; tpA[i] = tgt; cool = i + 6; }
-  };
-  const minLow = function (a, b) { let m = Infinity; for (let t = a; t <= b; t++) if (l[t] < m) m = l[t]; return m; };
-  const maxHigh = function (a, b) { let m = -Infinity; for (let t = a; t <= b; t++) if (h[t] > m) m = h[t]; return m; };
-  const used = {};
-  for (let i = 60; i < n; i++) {
-    const k = i - 3;
-    let isH = true, isL = true;
-    for (let j = 1; j <= 3; j++) {
-      if (!(h[k] > h[k - j]) || !(h[k] >= h[k + j])) isH = false;
-      if (!(l[k] < l[k - j]) || !(l[k] <= l[k + j])) isL = false;
-    }
-    if (isH) PH.push({ k: k, p: h[k] });
-    if (isL) PL.push({ k: k, p: l[k] });
-    const atr = D.atr[i];
-    if (!(atr > 0)) continue;
-    if (key === 'dbl') {
-      if (PL.length >= 2) {
-        const L2 = PL[PL.length - 1], L1 = PL[PL.length - 2], id = 'b' + L1.k + '_' + L2.k;
-        if (!used[id] && Math.abs(L1.p - L2.p) <= 0.5 * atr && L2.k - L1.k >= 6 && L2.k - L1.k <= 60 && i - L2.k <= 40) {
-          const neck = maxHigh(L1.k, L2.k), low = Math.min(L1.p, L2.p);
-          if (neck - low >= 2 * atr && c[i] > neck && c[i - 1] <= neck) { used[id] = true; put(i, 1, low - 0.1 * atr, neck + (neck - low), 0.9); }
-        }
-      }
-      if (PH.length >= 2) {
-        const H2 = PH[PH.length - 1], H1 = PH[PH.length - 2], id = 't' + H1.k + '_' + H2.k;
-        if (!used[id] && Math.abs(H1.p - H2.p) <= 0.5 * atr && H2.k - H1.k >= 6 && H2.k - H1.k <= 60 && i - H2.k <= 40) {
-          const neck = minLow(H1.k, H2.k), hi = Math.max(H1.p, H2.p);
-          if (hi - neck >= 2 * atr && c[i] < neck && c[i - 1] >= neck) { used[id] = true; put(i, -1, hi + 0.1 * atr, neck - (hi - neck), 0.9); }
-        }
-      }
-    } else if (key === 'hs') {
-      if (PH.length >= 3) {
-        const P3 = PH[PH.length - 1], P2 = PH[PH.length - 2], P1 = PH[PH.length - 3], id = 'h' + P1.k + '_' + P3.k;
-        if (!used[id] && P2.p > P1.p && P2.p > P3.p && Math.abs(P1.p - P3.p) <= atr && P2.p - Math.max(P1.p, P3.p) >= atr && P3.k - P1.k <= 80 && i - P3.k <= 40) {
-          const neck = minLow(P1.k, P3.k);
-          if (c[i] < neck && c[i - 1] >= neck) { used[id] = true; put(i, -1, P3.p + 0.1 * atr, neck - (P2.p - neck)); }
-        }
-      }
-      if (PL.length >= 3) {
-        const P3 = PL[PL.length - 1], P2 = PL[PL.length - 2], P1 = PL[PL.length - 3], id = 'i' + P1.k + '_' + P3.k;
-        if (!used[id] && P2.p < P1.p && P2.p < P3.p && Math.abs(P1.p - P3.p) <= atr && Math.min(P1.p, P3.p) - P2.p >= atr && P3.k - P1.k <= 80 && i - P3.k <= 40) {
-          const neck = maxHigh(P1.k, P3.k);
-          if (c[i] > neck && c[i - 1] <= neck) { used[id] = true; put(i, 1, P3.p - 0.1 * atr, neck + (neck - P2.p)); }
-        }
-      }
-    } else if (key === 'flag') {
-      for (let m = 5; m <= 12; m++) {
-        const j = i - m;
-        if (j < 10) break;
-        const pole = c[j] - c[j - 5];
-        const hiC = maxHigh(j + 1, i - 1), loC = minLow(j + 1, i - 1);
-        if (pole >= 3 * atr && hiC - loC <= 0.5 * pole && hiC <= h[j] + 0.3 * atr && c[i] > hiC && c[i - 1] <= hiC) { put(i, 1, loC - 0.1 * atr, c[i] + pole); break; }
-        if (-pole >= 3 * atr && hiC - loC <= 0.5 * -pole && loC >= l[j] - 0.3 * atr && c[i] < loC && c[i - 1] >= loC) { put(i, -1, hiC + 0.1 * atr, c[i] + pole); break; }
-      }
-    } else if (key === 'tri') {
-      if (PH.length >= 2 && PL.length >= 2) {
-        const H2 = PH[PH.length - 1], H1 = PH[PH.length - 2], L2 = PL[PL.length - 1], L1 = PL[PL.length - 2];
-        const span = Math.max(H2.k, L2.k) - Math.min(H1.k, L1.k);
-        if (span >= 10 && span <= 60 && i - Math.max(H2.k, L2.k) <= 30) {
-          const res = Math.max(H1.p, H2.p), sup = Math.min(L1.p, L2.p);
-          if (Math.abs(H1.p - H2.p) <= 0.3 * atr && L2.p > L1.p + 0.2 * atr && c[i] > res && c[i - 1] <= res) put(i, 1, L2.p - 0.1 * atr, c[i] + (res - L1.p));
-          else if (Math.abs(L1.p - L2.p) <= 0.3 * atr && H2.p < H1.p - 0.2 * atr && c[i] < sup && c[i - 1] >= sup) put(i, -1, H2.p + 0.1 * atr, c[i] - (H1.p - sup));
-        }
-      }
-    }
-  }
-  return { sig: sig, sl: slA, tp: tpA };
-}
-
 function runPatternTest() {
   if (!CAP_ON) return Promise.reject(new Error('Capital.com keys are missing.'));
   const errors = [], all = PAT_CANDLE.concat(PAT_CHART);
@@ -225,6 +147,146 @@ function mirrorSync() {
 let fwOn = process.env.FORWARD !== 'off';
 let fwRecs = [];
 let fwSeen = {};
+// ===== Volume-profile PoC retest (Wyckoff): accumulation box -> breakout -> fixed-range volume profile -> PoC retest =====
+// Capital.com gives tick counts, not real volume, so the profile is a proxy. Tested like every other idea with /poctest.
+let pocRunning = false;
+const POC = { acc: 20, scan: 90, boxAtr: 3.0, buf: 0.10, imp: 1.5, bins: 50, tol: 0.25, minAfter: 2, rej: 0.5 };
+
+function pocFrp(D, a, b) {                      // point of control over bars a..b
+  let mn = Infinity, mx = -Infinity, tot = 0;
+  for (let k = a; k <= b; k++) { if (D.l[k] < mn) mn = D.l[k]; if (D.h[k] > mx) mx = D.h[k]; tot += D.bars[k].v || 0; }
+  if (!(tot > 0) || !(mx > mn)) return null;
+  const nb = POC.bins, w = (mx - mn) / nb, prof = new Float64Array(nb);
+  for (let k = a; k <= b; k++) {
+    const v = D.bars[k].v || 0;
+    if (v <= 0) continue;
+    const lo = Math.min(nb - 1, Math.max(0, Math.floor((D.l[k] - mn) / w)));
+    const hi = Math.min(nb - 1, Math.max(0, Math.floor((D.h[k] - mn) / w)));
+    const sp = hi - lo + 1;
+    for (let q = lo; q <= hi; q++) prof[q] += v / sp;
+  }
+  let best = 0;
+  for (let q = 1; q < nb; q++) if (prof[q] > prof[best]) best = q;
+  return mn + best * w + w / 2;
+}
+
+function stPocSignals(D) {
+  const n = D.n, h = D.h, l = D.l, c = D.c, o = D.o;
+  const sig = new Int8Array(n), slA = new Float64Array(n), tpA = new Float64Array(n);
+  for (let i = POC.scan; i < n; i++) {
+    const w0 = i - POC.scan + 1;                  // window start
+    let cand = null;
+    for (let s = w0; s <= i - POC.acc - 3; s++) {
+      const e = s + POC.acc - 1;
+      const atr = D.atr[e];
+      if (!(atr > 0)) continue;
+      let bh = -Infinity, bl = Infinity;
+      for (let k = s; k <= e; k++) { if (h[k] > bh) bh = h[k]; if (l[k] < bl) bl = l[k]; }
+      if (bh - bl > POC.boxAtr * atr) continue;
+      const buf = POC.buf * atr;
+      let up = -1, dn = -1;
+      for (let k = e + 1; k <= i; k++) {
+        if (up < 0 && c[k] > bh + buf) up = k;
+        if (dn < 0 && c[k] < bl - buf) dn = k;
+        if (up >= 0 && dn >= 0) break;
+      }
+      if (up < 0 && dn < 0) continue;
+      let dir, bo, legEnd, impulse, swLo, swHi;
+      if (up >= 0 && (dn < 0 || up <= dn)) {
+        dir = 1; bo = up;
+        legEnd = e + 1;
+        for (let k = e + 1; k <= i; k++) if (h[k] > h[legEnd]) legEnd = k;
+        impulse = h[legEnd] - bl;
+        swLo = s; for (let k = s; k <= legEnd; k++) if (l[k] < l[swLo]) swLo = k;
+        swHi = legEnd;
+      } else {
+        dir = -1; bo = dn;
+        legEnd = e + 1;
+        for (let k = e + 1; k <= i; k++) if (l[k] < l[legEnd]) legEnd = k;
+        impulse = bh - l[legEnd];
+        swHi = s; for (let k = s; k <= legEnd; k++) if (h[k] > h[swHi]) swHi = k;
+        swLo = legEnd;
+      }
+      if (impulse < POC.imp * atr) continue;
+      if (i - bo < POC.minAfter) continue;
+      cand = { dir: dir, bo: bo, legEnd: legEnd, a: Math.min(swLo, swHi), b: Math.max(swLo, swHi), atr: atr };
+    }
+    if (!cand || i <= cand.legEnd) continue;
+    const poc = pocFrp(D, cand.a, cand.b);
+    if (poc === null) continue;
+    const tol = POC.tol * cand.atr, rng = Math.max(h[i] - l[i], 1e-12);
+    const aa = D.atr[i];
+    if (!(aa > 0)) continue;
+    if (cand.dir > 0) {
+      if (c[i - 1] <= poc) continue;
+      let ok = false;
+      for (let k = cand.bo; k < i; k++) if (c[k] > poc + tol) { ok = true; break; }
+      if (!ok) continue;
+      if (l[i] <= poc + tol && c[i] >= poc - tol && (c[i] - l[i]) >= POC.rej * rng) {
+        const stop = Math.min(l[i], poc - tol) - 0.1 * aa, tgt = h[cand.legEnd];
+        const risk = c[i] - stop, rew = tgt - c[i];
+        if (risk > 0 && rew / risk >= SMC_MIN_RR) { sig[i] = 1; slA[i] = stop; tpA[i] = tgt; }
+      }
+    } else {
+      if (c[i - 1] >= poc) continue;
+      let ok = false;
+      for (let k = cand.bo; k < i; k++) if (c[k] < poc - tol) { ok = true; break; }
+      if (!ok) continue;
+      if (h[i] >= poc - tol && c[i] <= poc + tol && (h[i] - c[i]) >= POC.rej * rng) {
+        const stop = Math.max(h[i], poc + tol) + 0.1 * aa, tgt = l[cand.legEnd];
+        const risk = stop - c[i], rew = c[i] - tgt;
+        if (risk > 0 && rew / risk >= SMC_MIN_RR) { sig[i] = -1; slA[i] = stop; tpA[i] = tgt; }
+      }
+    }
+  }
+  return { sig: sig, sl: slA, tp: tpA };
+}
+
+function runPocTest() {
+  if (!CAP_ON) return Promise.reject(new Error('Capital.com keys are missing.'));
+  const errors = [], rows = [];
+  const acc = [stNewAcc(), stNewAcc(), stNewAcc()], ctl = [stNewAcc(), stNewAcc(), stNewAcc()], per = [];
+  let used = 0, noVol = 0;
+  return ST_MARKETS.reduce(function (chain, sym) {
+    return chain.then(function () {
+      return stFetchHistory(sym, STRAT_PAGES, errors).then(function (b) {
+        if (b.length < 1000) { errors.push(sym + ': only ' + b.length + ' bars'); return null; }
+        if (!b.some(function (x) { return x.v > 0; })) { noVol++; return null; }
+        used++;
+        const D = stBuild(b);
+        const split = [Math.floor(D.n * 0.5), Math.floor(D.n * 0.75)];
+        const S = stPocSignals(D);
+        const a = [stNewAcc(), stNewAcc(), stNewAcc()];
+        stSimLv(D, S, split, a, rows, sym, 'poc');
+        const c = [stNewAcc(), stNewAcc(), stNewAcc()];
+        stSimLv(D, stSmcControl(D, S, 7000 + sym.length), split, c, null, sym, 'ctl');
+        for (let p = 0; p < 3; p++) [[acc[p], a[p]], [ctl[p], c[p]]].forEach(function (pr) {
+          pr[0].n += pr[1].n; pr[0].w += pr[1].w; pr[0].sumR += pr[1].sumR; pr[0].gp += pr[1].gp; pr[0].gl += pr[1].gl;
+        });
+        per.push(a[2]);
+        return new Promise(function (r) { setImmediate(r); });
+      });
+    });
+  }, Promise.resolve()).then(function () {
+    if (!used) throw new Error('No usable history (' + noVol + ' markets had no volume). ' + (errors[0] || ''));
+    const exps = acc.map(stExp), dd = stMaxDD(rows), t = evoTstat(rows, 2);
+    const posM = per.filter(function (x) { return stExp(x) > 0; }).length;
+    let verdict;
+    if (acc[0].n < 30 || acc[1].n < 30 || acc[2].n < 30) verdict = 'too few trades';
+    else if (exps[0] >= 0.05 && exps[1] >= 0.05 && exps[2] >= 0.05 && stPF(acc[2]) >= 1.15 && t >= 2 && exps[2] - stExp(ctl[2]) >= 0.05 && posM >= Math.ceil(used * 2 / 3)) verdict = 'PASS ✅';
+    else verdict = 'fail';
+    const m1 = ['📊 *' + md('Volume-profile PoC retest test') + '*',
+      md(used + ' markets, hourly. Box of 20 bars, breakout, 1.5 ATR move, profile of the move, entry on the PoC retest. Stop beyond the zone, target at the move extreme, reward at least ' + SMC_MIN_RR + 'x risk. Real spread + ' + STRAT_SLIP + 'x slippage. Same train / validation / out-of-sample split.'),
+      md('Volume here is Capital.com tick count, not real exchange volume, so this is a proxy of your strategy.')].join('\n');
+    const m2 = [md('Wyckoff PoC retest'),
+      md('  net R per trade: train ' + stF(exps[0]) + ' | validation ' + stF(exps[1]) + ' | out-of-sample ' + stF(exps[2]) + '  (n ' + acc[0].n + '/' + acc[1].n + '/' + acc[2].n + ')'),
+      md('  OOS PF ' + stPF(acc[2]).toFixed(2) + ', win ' + (acc[2].n ? Math.round(100 * acc[2].w / acc[2].n) : 0) + '%, t ' + t.toFixed(1) + ', max DD ' + dd.toFixed(1) + 'R, ' + posM + '/' + used + ' markets positive'),
+      md('  random control: ' + stF(stExp(ctl[0])) + ' | ' + stF(stExp(ctl[1])) + ' | ' + stF(stExp(ctl[2])) + ' -> ' + verdict)].join('\n');
+    const m3 = '*' + md(verdict.indexOf('PASS') === 0 ? 'Passed every check on one test period. Treat it as a lead only; the forward tracker is now recording it on live prices.' : 'Verdict: not proven. Do not trade it. The forward tracker keeps recording it on live prices.') + '*';
+    return { msgs: [m1, m2, m3] };
+  });
+}
+
 let fwLastHour = 0;
 let fwLastWeek = '';
 let fwDbOk = true;
@@ -234,7 +296,7 @@ const FW_NAMES = (function () {
   ST_STRATS.forEach(function (s) { if (s[0] !== 'rand') o[s[0]] = s[1]; });
   PAT_CANDLE.forEach(function (p) { o['c_' + p[0]] = p[1]; });
   PAT_CHART.forEach(function (p) { o['p_' + p[0]] = p[1]; });
-  o.m_fvg = SMC_NAMES.fvg; o.m_struct = SMC_NAMES.struct;
+  o.m_poc = 'Wyckoff volume-profile PoC retest'; o.m_fvg = SMC_NAMES.fvg; o.m_struct = SMC_NAMES.struct;
   return o;
 })();
 
@@ -272,7 +334,7 @@ function fwBars(symbol) {
   return capEpic(symbol).then(function (epic) { return capCall('GET', '/prices/' + epic + '?resolution=HOUR&max=500'); }).then(function (j) {
     const m = function (o) { return (Number(o.bid) + Number(o.ask)) / 2; };
     return (j.prices || []).map(function (x) {
-      return { t: Date.parse((x.snapshotTimeUTC || x.snapshotTime) + 'Z'), o: m(x.openPrice), h: m(x.highPrice), l: m(x.lowPrice), c: m(x.closePrice), sp: Math.abs(Number(x.openPrice.ask) - Number(x.openPrice.bid)) };
+      return { t: Date.parse((x.snapshotTimeUTC || x.snapshotTime) + 'Z'), o: m(x.openPrice), h: m(x.highPrice), l: m(x.lowPrice), c: m(x.closePrice), sp: Math.abs(Number(x.openPrice.ask) - Number(x.openPrice.bid)), v: Number(x.lastTradedVolume) || 0 };
     }).filter(function (b) { return !isNaN(b.t) && b.h > 0; }).sort(function (a, b) { return a.t - b.t; });
   });
 }
@@ -333,6 +395,7 @@ function fwNewSignals(sym, D, bars) {
   PAT_CANDLE.forEach(function (p) { try { atrExit('c_' + p[0], patCandle(D, p[0])[i]); } catch (err) { /* skip */ } });
   PAT_CHART.forEach(function (p) { try { const S = patChart(D, p[0]); if (S.sig[i]) add('p_' + p[0], S.sig[i], S.sl[i], S.tp[i]); } catch (err) { /* skip */ } });
   ['fvg', 'struct'].forEach(function (k) { try { const S = stSmcSignals(D, k); if (S.sig[i]) add('m_' + k, S.sig[i], S.sl[i], S.tp[i]); } catch (err) { /* skip */ } });
+  try { const S = stPocSignals(D); if (S.sig[i]) add('m_poc', S.sig[i], S.sl[i], S.tp[i]); } catch (err) { /* skip */ }
   return out;
 }
 
