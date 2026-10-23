@@ -1,44 +1,3 @@
-function maybeForward() {
-  if (!fwOn || !CAP_ON) return Promise.resolve();
-  const now = new Date();
-  const hourId = Math.floor(now.getTime() / 3600000);
-  if (now.getUTCMinutes() < 1 || now.getUTCMinutes() > 30 || hourId === fwLastHour) return Promise.resolve();
-  fwLastHour = hourId;
-  let added = 0, closed = 0;
-  return ST_MARKETS.reduce(function (chain, sym) {
-    return chain.then(function () {
-      return fwBars(sym).then(function (bars) {
-        if (bars.length < 300) return null;
-        const D = stBuild(bars);
-        if (Date.now() - bars[D.n - 2].t > 2.5 * 3600000) return null;   // market closed or stale
-        fwRecs.filter(function (r) { return r.m === sym && r.st === 'open'; }).forEach(function (r) {
-          if (fwResolve(r, D)) {
-            closed++;
-            fwDb('PATCH', '?id=eq.' + encodeURIComponent(r.id), { st: r.st, r: r.r, tc: r.tc });
-          }
-        });
-        const fresh = fwNewSignals(sym, D, bars);
-        fresh.forEach(function (r) { fwSeen[r.id] = true; fwRecs.push(r); added++; });
-        if (fresh.length) return fwDb('POST', '', fresh);
-        return null;
-      }).catch(function (e) { console.log('Forward ' + sym + ': ' + e.message); return null; });
-    });
-  }, Promise.resolve()).then(function () {
-    // keep memory bounded
-    const cl = fwRecs.filter(function (r) { return r.st !== 'open'; });
-    if (cl.length > FW_MAX_CLOSED) { const drop = {}; cl.slice(0, cl.length - FW_MAX_CLOSED).forEach(function (r) { drop[r.id] = true; }); fwRecs = fwRecs.filter(function (r) { return !drop[r.id]; }); }
-    console.log('Forward tracker: +' + added + ' signals, ' + closed + ' closed, ' + fwRecs.length + ' records');
-  });
-}
-
-function fwAgg(list) {
-  const a = { n: 0, w: 0, sum: 0, gp: 0, gl: 0 };
-  list.forEach(function (r) { a.n++; a.sum += r.r; if (r.r > 0) { a.w++; a.gp += r.r; } else a.gl += -r.r; });
-  a.pf = a.gl > 0 ? a.gp / a.gl : (a.gp > 0 ? 99 : 0);
-  a.exp = a.n ? a.sum / a.n : 0;
-  return a;
-}
-
 function fwReport() {
   const closed = fwRecs.filter(function (r) { return r.st === 'closed' && r.r !== null; });
   const open = fwRecs.filter(function (r) { return r.st === 'open'; }).length;
@@ -75,6 +34,51 @@ function maybeForwardWeekly() {
   fwLastWeek = key;
   return sendLong(fwReport());
 }
+
+// ===== Saved settings: switches and news-learning survive a Render restart (Supabase table bot_state) =====
+let stateOk = true, stateLast = '';
+function stateSnap() {
+  return JSON.stringify({
+    autoTrade: autoTrade, tradeBroker: tradeBroker, newsOn: newsOn, newsTrade: newsTrade, mirrorOn: mirrorOn, fwOn: fwOn,
+    ntStats: ntStats, ntMinAtr: ntMinAtr, ntAll: ntAll, pairResetAt: pairResetAt, pairPausedAt: pairPausedAt,
+  });
+}
+function stateSave() {
+  if (!DB_ON || !stateOk) return Promise.resolve();
+  const snap = stateSnap();
+  if (snap === stateLast) return Promise.resolve();
+  const h = dbHeaders(); h.Prefer = 'resolution=merge-duplicates,return=minimal';
+  return fetch(SUPABASE_URL + '/rest/v1/bot_state?on_conflict=k', {
+    method: 'POST', headers: h, body: JSON.stringify([{ k: 'main', v: JSON.parse(snap) }]),
+  }).then(function (r) {
+    if (r.ok) { stateLast = snap; return; }
+    return r.text().then(function (t) { stateOk = false; console.error('State save ' + r.status + ': ' + t.slice(0, 160) + ' (settings not saved until the bot_state table exists)'); });
+  }).catch(function (e) { console.error('State save failed: ' + e.message); });
+}
+function stateLoad() {
+  if (!DB_ON) return Promise.resolve();
+  return fetch(SUPABASE_URL + '/rest/v1/bot_state?k=eq.main&select=v', { headers: dbHeaders() }).then(function (r) {
+    if (!r.ok) { stateOk = false; return null; }
+    return r.json();
+  }).then(function (rows) {
+    const v = rows && rows[0] && rows[0].v;
+    if (!v) return;
+    if (typeof v.autoTrade === 'boolean') autoTrade = v.autoTrade;
+    if (v.tradeBroker === 'deriv' || v.tradeBroker === 'capital' || v.tradeBroker === 'both') tradeBroker = v.tradeBroker;
+    if (typeof v.newsOn === 'boolean') newsOn = v.newsOn;
+    if (typeof v.newsTrade === 'boolean') newsTrade = v.newsTrade;
+    if (typeof v.mirrorOn === 'boolean') mirrorOn = v.mirrorOn;
+    if (typeof v.fwOn === 'boolean') fwOn = v.fwOn;
+    if (v.ntStats && typeof v.ntStats === 'object') Object.keys(v.ntStats).forEach(function (k) { ntStats[k] = v.ntStats[k]; });
+    if (isFinite(Number(v.ntMinAtr)) && Number(v.ntMinAtr) > 0) ntMinAtr = Number(v.ntMinAtr);
+    if (v.ntAll && typeof v.ntAll === 'object') ntAll = v.ntAll;
+    if (v.pairResetAt) Object.keys(v.pairResetAt).forEach(function (k) { pairResetAt[k] = v.pairResetAt[k]; });
+    if (v.pairPausedAt) Object.keys(v.pairPausedAt).forEach(function (k) { pairPausedAt[k] = v.pairPausedAt[k]; });
+    stateLast = stateSnap();
+    console.log('Settings restored: auto-trade ' + autoTrade + ', broker ' + tradeBroker + ', mirror ' + mirrorOn);
+  }).catch(function (e) { console.error('State load failed: ' + e.message); });
+}
+setInterval(stateSave, 30000);
 
 function sendLong(text) {
   if (text.length <= 3800) return sendTelegram(text);
@@ -434,7 +438,7 @@ server.listen(PORT, function () {
     ' | Auto-trade: ' + autoTrade + ' | Demo account: ' + isDemoAccount());
   // Restart-proof: Render restarts the server now and then, so resume by itself
   console.log('Trade log: ' + (DB_ON ? 'Supabase' : 'memory only (set SUPABASE_URL and SUPABASE_KEY)'));
-  learn().then(capReconcile).then(fwLoad).then(function () {
+  stateLoad().then(learn).then(capReconcile).then(fwLoad).then(function () {
     if (process.env.BOT_AUTOSTART === 'true') startBot(true);
   });
 });
