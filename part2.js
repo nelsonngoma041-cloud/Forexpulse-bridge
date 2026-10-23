@@ -444,3 +444,41 @@ function checkPendingTrades() {
   }, Promise.resolve());
 }
 
+function maybeDailySummary() {
+  const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Africa/Lusaka' });
+  if (lusakaHour() === 8 && lastSummaryDate !== today) {
+    lastSummaryDate = today;
+    const total = dailyWins + dailyLosses;
+    const wr = total > 0 ? Math.round(dailyWins / total * 100) : 0;
+    return sendTelegram(
+      '📈 *Daily Summary*\n\n' +
+      'Signals: ' + md(signalCount) + '\n' +
+      'Wins: ' + md(dailyWins) + ' · Losses: ' + md(dailyLosses) + '\n' +
+      'Win rate: ' + md(wr) + '%'
+    ).then(function () { dailyWins = 0; dailyLosses = 0; signalCount = 0; });
+  }
+  return Promise.resolve();
+}
+
+// ---------- News filter ----------
+// Pauses NEW trades on markets that are hit by high-impact economic news,
+// from NEWS_BEFORE_MIN minutes before to NEWS_AFTER_MIN minutes after the release.
+// Volatility indices (Deriv) are synthetic, so news does not apply to them.
+// Calendar source: the free Forex Factory weekly feed. If it cannot be loaded, trading goes on.
+
+const NEWS_URL = process.env.NEWS_URL || 'https://nfs.faireconomy.media/ff_calendar_thisweek.json';
+let newsOn = process.env.NEWS_FILTER !== 'off';
+const NEWS_BEFORE_MIN = Number(process.env.NEWS_BEFORE_MIN || 30);
+const NEWS_AFTER_MIN = Number(process.env.NEWS_AFTER_MIN || 30);
+const NEWS_IMPACT = (process.env.NEWS_IMPACT || 'High').toLowerCase();   // High, or Medium to include medium news
+const NEWS_CCY = {
+  EURUSD: ['EUR', 'USD'], GBPUSD: ['GBP', 'USD'], USDJPY: ['USD', 'JPY'], AUDUSD: ['AUD', 'USD'],
+  USDCAD: ['USD', 'CAD'], GOLD: ['USD'], SILVER: ['USD'], US100: ['USD'], US500: ['USD'],
+  DE40: ['EUR'], J225: ['JPY', 'USD'], OIL: ['USD'], BTC: ['USD'], ETH: ['USD'],
+};
+let newsEvents = [];
+let newsLoadedAt = 0;
+let newsLastTry = 0;
+let newsStatus = 'not loaded yet';
+const newsNotified = {};
+
