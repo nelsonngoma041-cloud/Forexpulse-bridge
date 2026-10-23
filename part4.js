@@ -1,72 +1,3 @@
-function tick() {
-  if (!botRunning || scanning) return;
-  scanning = true;
-  Promise.resolve()
-    .then(checkPendingTrades)
-    .then(checkCapitalTrades)
-    .then(maybeDailySummary)
-    .then(dispatchSignal)
-    .then(function () { return ensureNews().then(maybeNewsTrade); })
-    .then(maybeEvolvedTrade)
-    .then(maybeSmcTrade)
-    .then(mirrorSync)
-    .then(maybeForward)
-    .then(maybeForwardWeekly)
-    .catch(function (e) { console.error('Tick error: ' + e.message); })
-    .then(function () { scanning = false; });
-}
-
-function startBot(announce) {
-  if (botRunning) return false;
-  botRunning = true;
-  if (loopTimer) clearInterval(loopTimer);
-  loopTimer = setInterval(tick, 60000);
-  tick();
-  if (announce) {
-    const s = getSession();
-    sendTelegram(
-      '🤖 *ForexPulse PRO running*\n\n' +
-      '✅ Real Deriv candles, RSI \\+ MACD \\+ MA20\n' +
-      '✅ Runs on the server, not your phone\n' +
-      (autoTrade ? '🤖 Auto\\-trading: *ON*' : '✋ Auto\\-trading: *OFF* \\(manual signals\\)') + '\n\n' +
-      '📱 /status /stop /auto on /auto off /balance\n\n' +
-      s.emoji + ' ' + md(s.message)
-    );
-  }
-  return true;
-}
-
-function stopBot() {
-  if (!botRunning) return false;
-  botRunning = false;
-  if (loopTimer) { clearInterval(loopTimer); loopTimer = null; }
-  return true;
-}
-
-function botStatus() {
-  return {
-    running: botRunning,
-    autoTrade: autoTrade,
-    signalCount: signalCount,
-    dailyWins: dailyWins,
-    dailyLosses: dailyLosses,
-    openTrades: pendingTrades.length,
-    mt5Connected: false,
-    derivConnected: !!(DERIV_API_TOKEN && DERIV_ACCOUNT_ID),
-    recentSignals: recentSignals,
-    message: botRunning
-      ? 'Running — ' + signalCount + ' signals' + (autoTrade ? ' (auto-trading)' : '')
-      : 'Bot stopped',
-  };
-}
-
-// ---------- Backtest ----------
-// Replays the strategies on past 1-minute candles and counts wins.
-// Trades never overlap (after a trade, skip until it would have ended).
-
-let backtesting = false;
-const BT_LENGTHS = [5, 15];
-
 function comboVote(votes) {
   let nBuy = 0, nSell = 0;
   STRATEGIES.forEach(function (k) {
@@ -440,6 +371,7 @@ function stFetchHistory(symbol, pages, errors) {
             t: Date.parse((x.snapshotTimeUTC || x.snapshotTime) + 'Z'),
             o: m(x.openPrice), h: m(x.highPrice), l: m(x.lowPrice), c: m(x.closePrice),
             sp: Math.abs(Number(x.openPrice.ask) - Number(x.openPrice.bid)),
+            v: Number(x.lastTradedVolume) || 0,
           };
         }).filter(function (b) { return !isNaN(b.t) && b.h > 0; });
         if (!arr.length) return all;
@@ -457,5 +389,223 @@ function stFetchHistory(symbol, pages, errors) {
     return all.filter(function (b) { if (seen[b.t]) return false; seen[b.t] = true; return true; })
       .sort(function (a, b) { return a.t - b.t; });
   });
+}
+
+// ----- indicators over arrays -----
+function stEma(a, p) {
+  const out = new Array(a.length);
+  const k = 2 / (p + 1);
+  out[0] = a[0];
+  for (let i = 1; i < a.length; i++) out[i] = a[i] * k + out[i - 1] * (1 - k);
+  return out;
+}
+function stWilder(a, p, start) {
+  const out = new Array(a.length).fill(NaN);
+  let sum = 0;
+  for (let i = start; i < start + p; i++) sum += a[i];
+  out[start + p - 1] = sum / p;
+  for (let i = start + p; i < a.length; i++) out[i] = (out[i - 1] * (p - 1) + a[i]) / p;
+  return out;
+}
+function stBuild(bars) {
+  const n = bars.length;
+  const o = bars.map(function (b) { return b.o; }), h = bars.map(function (b) { return b.h; });
+  const l = bars.map(function (b) { return b.l; }), c = bars.map(function (b) { return b.c; });
+  const D = { n: n, bars: bars, o: o, h: h, l: l, c: c, sp: bars.map(function (b) { return b.sp; }) };
+  const tr = [0], pdm = [0], mdm = [0];
+  for (let i = 1; i < n; i++) {
+    tr.push(Math.max(h[i] - l[i], Math.abs(h[i] - c[i - 1]), Math.abs(l[i] - c[i - 1])));
+    const up = h[i] - h[i - 1], dn = l[i - 1] - l[i];
+    pdm.push(up > dn && up > 0 ? up : 0);
+    mdm.push(dn > up && dn > 0 ? dn : 0);
+  }
+  D.atr = stWilder(tr, 14, 1);
+  const str = stWilder(tr, 14, 1), sp = stWilder(pdm, 14, 1), sm = stWilder(mdm, 14, 1);
+  D.pdi = new Array(n).fill(NaN); D.mdi = new Array(n).fill(NaN);
+  const dx = new Array(n).fill(0);
+  for (let i = 0; i < n; i++) {
+    if (str[i] > 0) {
+      D.pdi[i] = 100 * sp[i] / str[i]; D.mdi[i] = 100 * sm[i] / str[i];
+      const sum = D.pdi[i] + D.mdi[i];
+      dx[i] = sum > 0 ? 100 * Math.abs(D.pdi[i] - D.mdi[i]) / sum : 0;
+    }
+  }
+  D.adx = stWilder(dx, 14, 14);
+  D.ema20 = stEma(c, 20); D.ema50 = stEma(c, 50); D.ema200 = stEma(c, 200);
+  // RSI (Wilder)
+  const gain = [0], loss = [0];
+  for (let i = 1; i < n; i++) { const d = c[i] - c[i - 1]; gain.push(d > 0 ? d : 0); loss.push(d < 0 ? -d : 0); }
+  const ag = stWilder(gain, 14, 1), al = stWilder(loss, 14, 1);
+  D.rsi = ag.map(function (g, i) { return al[i] === 0 ? 100 : 100 - 100 / (1 + g / al[i]); });
+  // MACD histogram
+  const e12 = stEma(c, 12), e26 = stEma(c, 26);
+  const macdLine = e12.map(function (v, i) { return v - e26[i]; });
+  const sig9 = stEma(macdLine, 9);
+  D.hist = macdLine.map(function (v, i) { return v - sig9[i]; });
+  // Bollinger (20, 2)
+  D.bbU = new Array(n).fill(NaN); D.bbL = new Array(n).fill(NaN);
+  for (let i = 19; i < n; i++) {
+    let s = 0;
+    for (let k = i - 19; k <= i; k++) s += c[k];
+    const mean = s / 20;
+    let v = 0;
+    for (let k = i - 19; k <= i; k++) v += (c[k] - mean) * (c[k] - mean);
+    const sd = Math.sqrt(v / 20);
+    D.bbU[i] = mean + 2 * sd; D.bbL[i] = mean - 2 * sd;
+  }
+  // Donchian 20 of the PRIOR bars, and the 10 prior bars' extremes
+  D.dHi = new Array(n).fill(NaN); D.dLo = new Array(n).fill(NaN);
+  D.p10Hi = new Array(n).fill(NaN); D.p10Lo = new Array(n).fill(NaN);
+  for (let i = 20; i < n; i++) {
+    let hi = -Infinity, lo = Infinity;
+    for (let k = i - 20; k < i; k++) { if (h[k] > hi) hi = h[k]; if (l[k] < lo) lo = l[k]; }
+    D.dHi[i] = hi; D.dLo[i] = lo;
+    let hi2 = -Infinity, lo2 = Infinity;
+    for (let k = i - 10; k < i; k++) { if (h[k] > hi2) hi2 = h[k]; if (l[k] < lo2) lo2 = l[k]; }
+    D.p10Hi[i] = hi2; D.p10Lo[i] = lo2;
+  }
+  // Ichimoku (cloud shifted 26 bars forward, so no look-ahead)
+  const hl = function (i, p) {
+    let hi = -Infinity, lo = Infinity;
+    for (let k = i - p + 1; k <= i; k++) { if (h[k] > hi) hi = h[k]; if (l[k] < lo) lo = l[k]; }
+    return (hi + lo) / 2;
+  };
+  D.tenkan = new Array(n).fill(NaN); D.kijun = new Array(n).fill(NaN);
+  D.cloudTop = new Array(n).fill(NaN); D.cloudBot = new Array(n).fill(NaN);
+  for (let i = 51; i < n; i++) { D.tenkan[i] = hl(i, 9); D.kijun[i] = hl(i, 26); }
+  for (let i = 51 + 26; i < n; i++) {
+    const j = i - 26;
+    const a = (D.tenkan[j] + D.kijun[j]) / 2, b = hl(j, 52);
+    D.cloudTop[i] = Math.max(a, b); D.cloudBot[i] = Math.min(a, b);
+  }
+  // Higher timeframe (4h) trend, using only completed 4h bars
+  D.h4up = new Array(n).fill(0);
+  let h4ema = NaN, h4state = 0, curId = null;
+  const k4 = 2 / 51;
+  for (let i = 0; i < n; i++) {
+    const id = Math.floor(bars[i].t / 14400000);
+    if (curId !== null && id !== curId) {
+      const closed = c[i - 1];
+      h4ema = isNaN(h4ema) ? closed : closed * k4 + h4ema * (1 - k4);
+      h4state = closed > h4ema ? 1 : -1;
+    }
+    curId = id;
+    D.h4up[i] = h4state;
+  }
+  // Previous UTC day high and low, and today's Asian range (00:00 to 07:00 UTC)
+  D.pdH = new Array(n).fill(NaN); D.pdL = new Array(n).fill(NaN);
+  let day = null, dH = -Infinity, dL = Infinity, pH = NaN, pL = NaN;
+  for (let i = 0; i < n; i++) {
+    const d = new Date(bars[i].t).toISOString().slice(0, 10);
+    if (d !== day) { if (day !== null) { pH = dH; pL = dL; } day = d; dH = -Infinity; dL = Infinity; }
+    D.pdH[i] = pH; D.pdL[i] = pL;
+    if (h[i] > dH) dH = h[i];
+    if (l[i] < dL) dL = l[i];
+  }
+  // typical spread, to reject abnormal spreads
+  const sps = D.sp.filter(function (x) { return x > 0; }).sort(function (a, b) { return a - b; });
+  D.medSp = sps.length ? sps[Math.floor(sps.length / 2)] : 0;
+  return D;
+}
+
+// ----- signal generators: +1 buy, -1 sell, 0 nothing. Signal at close of bar i. -----
+function stSignals(key, D, seed) {
+  const n = D.n, sig = new Int8Array(n);
+  const c = D.c, o = D.o, h = D.h, l = D.l;
+  let st = null, rngSeed = seed;
+  const rnd = function () { rngSeed = (rngSeed + 0x6D2B79F5) | 0; let t = Math.imul(rngSeed ^ (rngSeed >>> 15), 1 | rngSeed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  let res = NaN, sup = NaN;
+  let aDay = null, aHi = -Infinity, aLo = Infinity, aFiredUp = false, aFiredDn = false;
+  for (let i = ST_WARM; i < n; i++) {
+    const atr = D.atr[i];
+    let s = 0;
+    if (key === 'ema') {
+      if (D.ema20[i - 1] <= D.ema50[i - 1] && D.ema20[i] > D.ema50[i] && c[i] > D.ema200[i]) s = 1;
+      else if (D.ema20[i - 1] >= D.ema50[i - 1] && D.ema20[i] < D.ema50[i] && c[i] < D.ema200[i]) s = -1;
+    } else if (key === 'mtf') {
+      if (D.ema20[i - 1] <= D.ema50[i - 1] && D.ema20[i] > D.ema50[i] && D.h4up[i] === 1) s = 1;
+      else if (D.ema20[i - 1] >= D.ema50[i - 1] && D.ema20[i] < D.ema50[i] && D.h4up[i] === -1) s = -1;
+    } else if (key === 'pull') {
+      let minR = 100, maxR = 0;
+      for (let k = i - 5; k < i; k++) { if (D.rsi[k] < minR) minR = D.rsi[k]; if (D.rsi[k] > maxR) maxR = D.rsi[k]; }
+      if (D.ema50[i] > D.ema200[i] && c[i] > D.ema200[i] && D.adx[i] > 20 && minR < 40 &&
+          D.rsi[i] > D.rsi[i - 1] && l[i] <= D.ema50[i] + 0.5 * atr && c[i] > D.ema50[i] && c[i] > o[i]) s = 1;
+      else if (D.ema50[i] < D.ema200[i] && c[i] < D.ema200[i] && D.adx[i] > 20 && maxR > 60 &&
+          D.rsi[i] < D.rsi[i - 1] && h[i] >= D.ema50[i] - 0.5 * atr && c[i] < D.ema50[i] && c[i] < o[i]) s = -1;
+    } else if (key === 'adx') {
+      if (D.adx[i] > 20 && D.pdi[i - 1] <= D.mdi[i - 1] && D.pdi[i] > D.mdi[i] && D.ema20[i] > D.ema50[i]) s = 1;
+      else if (D.adx[i] > 20 && D.pdi[i - 1] >= D.mdi[i - 1] && D.pdi[i] < D.mdi[i] && D.ema20[i] < D.ema50[i]) s = -1;
+    } else if (key === 'donch') {
+      if (c[i] > D.dHi[i]) s = 1; else if (c[i] < D.dLo[i]) s = -1;
+    } else if (key === 'srb') {
+      const k = i - 5;
+      if (k >= 5) {
+        let isH = true, isL = true;
+        for (let m = k - 5; m <= k + 5; m++) { if (h[m] > h[k]) isH = false; if (l[m] < l[k]) isL = false; }
+        if (isH) res = h[k];
+        if (isL) sup = l[k];
+      }
+      if (!isNaN(res) && c[i] > res && c[i - 1] <= res) { s = 1; res = NaN; }
+      else if (!isNaN(sup) && c[i] < sup && c[i - 1] >= sup) { s = -1; sup = NaN; }
+    } else if (key === 'retest') {
+      if (st && i - st.bar > 12) st = null;
+      if (st) {
+        if (st.dir === 1) {
+          if (c[i] < st.level - atr) st = null;
+          else if (l[i] <= st.level + 0.3 * atr && c[i] > st.level && c[i] > o[i]) { s = 1; st = null; }
+        } else {
+          if (c[i] > st.level + atr) st = null;
+          else if (h[i] >= st.level - 0.3 * atr && c[i] < st.level && c[i] < o[i]) { s = -1; st = null; }
+        }
+      }
+      if (!st && s === 0) {
+        if (c[i] > D.dHi[i]) st = { dir: 1, level: D.dHi[i], bar: i };
+        else if (c[i] < D.dLo[i]) st = { dir: -1, level: D.dLo[i], bar: i };
+      }
+    } else if (key === 'asian') {
+      const dt = new Date(D.bars[i].t);
+      const d = dt.toISOString().slice(0, 10), hr = dt.getUTCHours();
+      if (d !== aDay) { aDay = d; aHi = -Infinity; aLo = Infinity; aFiredUp = false; aFiredDn = false; }
+      if (hr < 7) { if (h[i] > aHi) aHi = h[i]; if (l[i] < aLo) aLo = l[i]; }
+      else if (hr < 12 && aHi > aLo && (aHi - aLo) > 0.5 * atr) {
+        if (c[i] > aHi && !aFiredUp) { s = 1; aFiredUp = true; }
+        else if (c[i] < aLo && !aFiredDn) { s = -1; aFiredDn = true; }
+      }
+    } else if (key === 'bbmr') {
+      if (D.adx[i] < 22) {
+        if (c[i - 1] < D.bbL[i - 1] && c[i] > D.bbL[i]) s = 1;
+        else if (c[i - 1] > D.bbU[i - 1] && c[i] < D.bbU[i]) s = -1;
+      }
+    } else if (key === 'rsimr') {
+      if (D.adx[i] < 22) {
+        if (D.rsi[i - 1] < 30 && D.rsi[i] >= 30) s = 1;
+        else if (D.rsi[i - 1] > 70 && D.rsi[i] <= 70) s = -1;
+      }
+    } else if (key === 'macd') {
+      if (D.hist[i - 1] <= 0 && D.hist[i] > 0 && c[i] > D.ema200[i]) s = 1;
+      else if (D.hist[i - 1] >= 0 && D.hist[i] < 0 && c[i] < D.ema200[i]) s = -1;
+    } else if (key === 'candle') {
+      if (c[i - 1] < o[i - 1] && c[i] > o[i] && c[i] >= o[i - 1] && o[i] <= c[i - 1] && l[i] <= D.p10Lo[i]) s = 1;
+      else if (c[i - 1] > o[i - 1] && c[i] < o[i] && c[i] <= o[i - 1] && o[i] >= c[i - 1] && h[i] >= D.p10Hi[i]) s = -1;
+    } else if (key === 'pday') {
+      if (!isNaN(D.pdH[i])) {
+        if (c[i] > D.pdH[i] && c[i - 1] <= D.pdH[i]) s = 1;
+        else if (c[i] < D.pdL[i] && c[i - 1] >= D.pdL[i]) s = -1;
+      }
+    } else if (key === 'atrb') {
+      const prevAtr = D.atr[i - 1];
+      if (c[i] - c[i - 1] > 1.5 * prevAtr && c[i] > D.ema50[i]) s = 1;
+      else if (c[i - 1] - c[i] > 1.5 * prevAtr && c[i] < D.ema50[i]) s = -1;
+    } else if (key === 'ichi') {
+      if (!isNaN(D.cloudTop[i])) {
+        if (c[i] > D.cloudTop[i] && D.tenkan[i - 1] <= D.kijun[i - 1] && D.tenkan[i] > D.kijun[i]) s = 1;
+        else if (c[i] < D.cloudBot[i] && D.tenkan[i - 1] >= D.kijun[i - 1] && D.tenkan[i] < D.kijun[i]) s = -1;
+      }
+    } else if (key === 'rand') {
+      if (rnd() < 0.03) s = rnd() < 0.5 ? 1 : -1;
+    }
+    sig[i] = s;
+  }
+  return sig;
 }
 
