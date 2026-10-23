@@ -1,113 +1,3 @@
-function runPatternTest() {
-  if (!CAP_ON) return Promise.reject(new Error('Capital.com keys are missing.'));
-  const errors = [], all = PAT_CANDLE.concat(PAT_CHART);
-  const acc = {}, ctl = {}, per = {}, rows = {};
-  all.forEach(function (p) { acc[p[0]] = [stNewAcc(), stNewAcc(), stNewAcc()]; ctl[p[0]] = [stNewAcc(), stNewAcc(), stNewAcc()]; per[p[0]] = []; rows[p[0]] = []; });
-  let used = 0;
-  const addTo = function (dst, src) { for (let p = 0; p < 3; p++) { dst[p].n += src[p].n; dst[p].w += src[p].w; dst[p].sumR += src[p].sumR; dst[p].gp += src[p].gp; dst[p].gl += src[p].gl; } };
-  return ST_MARKETS.reduce(function (chain, sym) {
-    return chain.then(function () {
-      return stFetchHistory(sym, STRAT_PAGES, errors).then(function (b) {
-        if (b.length < 1000) { errors.push(sym + ': only ' + b.length + ' bars'); return null; }
-        used++;
-        const D = stBuild(b);
-        const split = [Math.floor(D.n * 0.5), Math.floor(D.n * 0.75)];
-        const rsig = stSignals('rand', D, 777 + sym.length);
-        PAT_CANDLE.forEach(function (p) {
-          const sig = patCandle(D, p[0]);
-          const a = [stNewAcc(), stNewAcc(), stNewAcc()], c = [stNewAcc(), stNewAcc(), stNewAcc()];
-          stSim(D, sig, ST_VARIANTS[0], split, a, { overlap: 0, wideSpread: 0, noAtr: 0 }, rows[p[0]], null, sym, p[0]);
-          // control: random entries with the same number of trades and same stop and target rule
-          const cs = new Int8Array(D.n), R = { s: 31 + sym.length };
-          let cnt = 0; for (let i = 0; i < D.n; i++) if (sig[i] !== 0) cnt++;
-          for (let q = 0; q < cnt; q++) cs[ST_WARM + Math.floor(evoRand(R) * (D.n - ST_WARM - 4))] = evoRand(R) < 0.5 ? 1 : -1;
-          stSim(D, cs, ST_VARIANTS[0], split, c, { overlap: 0, wideSpread: 0, noAtr: 0 }, null, null, sym, 'ctl');
-          addTo(acc[p[0]], a); addTo(ctl[p[0]], c); per[p[0]].push(a[2]);
-        });
-        PAT_CHART.forEach(function (p, pi) {
-          const S = patChart(D, p[0]);
-          const a = [stNewAcc(), stNewAcc(), stNewAcc()], c = [stNewAcc(), stNewAcc(), stNewAcc()];
-          stSimLv(D, S, split, a, rows[p[0]], sym, p[0]);
-          stSimLv(D, stSmcControl(D, S, 9100 + pi * 17 + sym.length), split, c, null, sym, 'ctl');
-          addTo(acc[p[0]], a); addTo(ctl[p[0]], c); per[p[0]].push(a[2]);
-        });
-        return new Promise(function (r) { setImmediate(r); });
-      });
-    });
-  }, Promise.resolve()).then(function () {
-    if (!used) throw new Error('No history could be loaded. ' + (errors[0] || ''));
-    const msgs = [['📐 *' + md('Pattern test') + '*',
-      md(used + ' markets, hourly. Candlestick patterns (against a trend, stop 1.5x ATR, target 2x) and chart patterns (neckline or boundary break, stop beyond the pattern, measured-move target, reward at least ' + SMC_MIN_RR + 'x risk, 0.9x for double tops and bottoms). Real spread + ' + STRAT_SLIP + 'x slippage, same train / validation / out-of-sample split.'),
-      md('Control = random entries, same number of trades and same stop and target rule.')].join('\n')];
-    const lines = [];
-    const pass = [];
-    all.forEach(function (p) {
-      const a = acc[p[0]], c = ctl[p[0]], exps = a.map(stExp);
-      const posM = per[p[0]].filter(function (x) { return stExp(x) > 0; }).length;
-      const t = evoTstat(rows[p[0]], 2);
-      let verdict;
-      if (a[0].n < 30 || a[1].n < 30 || a[2].n < 30) verdict = 'too few trades';
-      else if (exps[0] >= 0.05 && exps[1] >= 0.05 && exps[2] >= 0.05 && stPF(a[2]) >= 1.15 && t >= 2 && exps[2] - stExp(c[2]) >= 0.05 && posM >= Math.ceil(used * 2 / 3)) { verdict = 'PASS ✅'; pass.push(p[1]); }
-      else verdict = 'fail';
-      lines.push(md(p[1] + ': ' + stF(exps[0]) + ' | ' + stF(exps[1]) + ' | ' + stF(exps[2]) + 'R (n ' + a[0].n + '/' + a[1].n + '/' + a[2].n + '), OOS PF ' + stPF(a[2]).toFixed(2) + ', win ' + (a[2].n ? Math.round(100 * a[2].w / a[2].n) : 0) + '%, ' + posM + '/' + used + ' markets +, control ' + stF(stExp(c[2])) + ' -> ' + verdict));
-    });
-    msgs.push(['*' + md('Net R per trade: train | validation | out-of-sample') + '*'].concat(lines).join('\n'));
-    msgs.push(pass.length
-      ? '*' + md('Passed: ' + pass.join(', ') + '. One test period, so treat it as a lead and confirm on new data before any live use. Tell me and I will wire it to the demo trading.') + '*'
-      : '*' + md('Verdict: no pattern passed every check. None of these are enabled, and none are worth trading on this evidence.') + '*');
-    return { msgs: msgs };
-  });
-}
-
-// ---------- Restart safety and emergency stop ----------
-// After a restart the bot forgets its open trades. This reads the open positions from Capital.com
-// and adopts them again, so wins and losses are still recorded and the time limit still applies.
-// The stop loss and take profit are already stored at the broker, so they work even while the bot is down.
-function capReconcile() {
-  if (!CAP_ON || tradeBroker === 'deriv') return Promise.resolve();
-  return capCall('GET', '/positions').then(function (j) {
-    let n = 0;
-    (j.positions || []).forEach(function (x) {
-      const p = x.position || {}, m = x.market || {};
-      const dealId = p.dealId;
-      if (!dealId || pendingTrades.some(function (t) { return String(t.contractId) === String(dealId); })) return;
-      const epic = m.epic;
-      const pair = PAIRS.filter(function (q) { return q.epic === epic || q.symbol === epic || CAP_RESOLVED[q.symbol] === epic; })[0];
-      pendingTrades.push({
-        contractId: dealId, display: pair ? pair.display : (m.instrumentName || epic), symbol: pair ? pair.symbol : epic,
-        action: p.direction === 'BUY' ? 'BUY' : 'SELL',
-        placedAt: Date.parse((p.createdDateUTC || '') + 'Z') || Date.now(), votes: {}, minutes: 2880, holdMin: 2880, broker: 'capital', recovered: true,
-      });
-      n++;
-    });
-    if (n) return sendTelegram('🔄 Restart check: picked up ' + md(n) + ' open Capital\\.com trade\\(s\\)\\. Their stop loss and take profit are still active at the broker\\.');
-    return null;
-  }).catch(function (e) { console.error('Reconcile: ' + e.message); });
-}
-
-// /panic : stop new trades and close every Capital.com trade the bot knows about
-function panicStop() {
-  autoTrade = false;
-  evoOn = false; smcOn = false;
-  const mine = pendingTrades.filter(function (t) { return t.broker === 'capital'; });
-  let closed = 0;
-  return mine.reduce(function (chain, t) {
-    return chain.then(function () {
-      return capCall('DELETE', '/positions/' + encodeURIComponent(t.contractId)).then(function () { closed++; }).catch(function (e) { console.error('Panic close: ' + e.message); });
-    });
-  }, Promise.resolve()).then(function () {
-    return sendTelegram('🚨 *PANIC*: auto\\-trading is OFF\\. Closing ' + md(closed) + ' of ' + md(mine.length) + ' Capital\\.com trade\\(s\\)\\. Results are reported as they settle\\. Deriv trades finish on their own timer\\. Use /auto on to restart\\.');
-  });
-}
-
-// ---------- Mirror: copy every Capital.com trade onto Deriv ----------
-// With /mirror on, each new Capital.com trade on a market Deriv also offers (forex pairs, gold, silver)
-// is copied on Deriv in the same direction, as a Rise/Fall contract with the usual stake and duration.
-// It is not the same instrument: Deriv's contract has no stop loss or take profit and ends after its
-// duration, while the Capital.com trade stays open until its stop, target or time limit.
-let mirrorOn = process.env.MIRROR === 'on';
-const mirrorWarned = {};
-
 function openCount() { return pendingTrades.filter(function (t) { return !t.mirrorOf; }).length; }
 
 function mirrorSync() {
@@ -397,5 +287,46 @@ function fwNewSignals(sym, D, bars) {
   ['fvg', 'struct'].forEach(function (k) { try { const S = stSmcSignals(D, k); if (S.sig[i]) add('m_' + k, S.sig[i], S.sl[i], S.tp[i]); } catch (err) { /* skip */ } });
   try { const S = stPocSignals(D); if (S.sig[i]) add('m_poc', S.sig[i], S.sl[i], S.tp[i]); } catch (err) { /* skip */ }
   return out;
+}
+
+function maybeForward() {
+  if (!fwOn || !CAP_ON) return Promise.resolve();
+  const now = new Date();
+  const hourId = Math.floor(now.getTime() / 3600000);
+  if (now.getUTCMinutes() < 1 || now.getUTCMinutes() > 30 || hourId === fwLastHour) return Promise.resolve();
+  fwLastHour = hourId;
+  let added = 0, closed = 0;
+  return ST_MARKETS.reduce(function (chain, sym) {
+    return chain.then(function () {
+      return fwBars(sym).then(function (bars) {
+        if (bars.length < 300) return null;
+        const D = stBuild(bars);
+        if (Date.now() - bars[D.n - 2].t > 2.5 * 3600000) return null;   // market closed or stale
+        fwRecs.filter(function (r) { return r.m === sym && r.st === 'open'; }).forEach(function (r) {
+          if (fwResolve(r, D)) {
+            closed++;
+            fwDb('PATCH', '?id=eq.' + encodeURIComponent(r.id), { st: r.st, r: r.r, tc: r.tc });
+          }
+        });
+        const fresh = fwNewSignals(sym, D, bars);
+        fresh.forEach(function (r) { fwSeen[r.id] = true; fwRecs.push(r); added++; });
+        if (fresh.length) return fwDb('POST', '', fresh);
+        return null;
+      }).catch(function (e) { console.log('Forward ' + sym + ': ' + e.message); return null; });
+    });
+  }, Promise.resolve()).then(function () {
+    // keep memory bounded
+    const cl = fwRecs.filter(function (r) { return r.st !== 'open'; });
+    if (cl.length > FW_MAX_CLOSED) { const drop = {}; cl.slice(0, cl.length - FW_MAX_CLOSED).forEach(function (r) { drop[r.id] = true; }); fwRecs = fwRecs.filter(function (r) { return !drop[r.id]; }); }
+    console.log('Forward tracker: +' + added + ' signals, ' + closed + ' closed, ' + fwRecs.length + ' records');
+  });
+}
+
+function fwAgg(list) {
+  const a = { n: 0, w: 0, sum: 0, gp: 0, gl: 0 };
+  list.forEach(function (r) { a.n++; a.sum += r.r; if (r.r > 0) { a.w++; a.gp += r.r; } else a.gl += -r.r; });
+  a.pf = a.gl > 0 ? a.gp / a.gl : (a.gp > 0 ? 99 : 0);
+  a.exp = a.n ? a.sum / a.n : 0;
+  return a;
 }
 
