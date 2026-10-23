@@ -1,13 +1,3 @@
-// Recent 1-minute closes from Capital.com, for the signal analysis
-function capCloses(epic) {
-  return capCall('GET', '/prices/' + epic + '?resolution=MINUTE&max=100').then(function (j) {
-    return (j.prices || []).map(function (x) { return (Number(x.closePrice.bid) + Number(x.closePrice.ask)) / 2; });
-  });
-}
-
-let capTokens = null;      // { cst, sec, at }
-let capLastLogin = 0;
-
 function capLogin() {
   if (!CAP_ON) return Promise.reject(new Error('Capital.com is not set up. Add CAPITAL_API_KEY, CAPITAL_API_PASSWORD, CAPITAL_EMAIL in Render.'));
   const wait = Math.max(0, 1200 - (Date.now() - capLastLogin));   // limit: 1 login per second
@@ -418,4 +408,39 @@ function recordResult(won, profit) {
   }
 }
 let circuitNotified = false;
+
+function checkPendingTrades() {
+  const now = Date.now();
+  const due = pendingTrades.filter(function (t) { return now - t.placedAt >= ((t.minutes || 15) + 0.5) * 60 * 1000; });
+  return due.reduce(function (chain, t) {
+    return chain.then(function () {
+      return checkContract(t.contractId).then(function (r) {
+        if (!r.is_sold && now - t.placedAt < ((t.minutes || 15) + 10) * 60 * 1000) return null;
+        const profit = Number(r.profit || 0);
+        const won = r.status === 'won' || profit > 0;
+        if (t.mirrorOf) {
+          pendingTrades.splice(pendingTrades.indexOf(t), 1);
+          return sendTelegram('🪞 Mirror ' + (won ? '*WIN*' : '*LOSS*') + ' — ' + md(t.display) + ' ' + md(t.action) + ' · ' + md(profit.toFixed(2)));
+        }
+        if (won) dailyWins++; else dailyLosses++;
+        recordResult(won, profit);
+        pendingTrades.splice(pendingTrades.indexOf(t), 1);
+        const closedRow = {
+          contract_id: String(t.contractId), symbol: t.symbol, action: t.action,
+          votes: t.votes || {}, won: won, profit: profit, closed_at: new Date().toISOString(),
+        };
+        memLog.unshift(closedRow);
+        if (memLog.length > 500) memLog.pop();
+        dbCloseTrade(String(t.contractId), { won: won, profit: profit, closed_at: closedRow.closed_at });
+        closedSinceLearn++;
+        if (closedSinceLearn >= RECOMPUTE_EVERY) { closedSinceLearn = 0; learn(true); }
+        return sendTelegram(
+          (won ? '✅ *WIN*' : '❌ *LOSS*') + ' — ' + md(t.display) + ' ' + md(t.action) + '\n' +
+          'Profit: ' + md(profit.toFixed(2)) + '\n' +
+          'Total: ' + md(dailyWins) + 'W/' + md(dailyLosses) + 'L'
+        );
+      }).catch(function (e) { console.error('Check failed: ' + e.message); });
+    });
+  }, Promise.resolve());
+}
 
