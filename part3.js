@@ -1,38 +1,3 @@
-function checkPendingTrades() {
-  const now = Date.now();
-  const due = pendingTrades.filter(function (t) { return now - t.placedAt >= ((t.minutes || 15) + 0.5) * 60 * 1000; });
-  return due.reduce(function (chain, t) {
-    return chain.then(function () {
-      return checkContract(t.contractId).then(function (r) {
-        if (!r.is_sold && now - t.placedAt < ((t.minutes || 15) + 10) * 60 * 1000) return null;
-        const profit = Number(r.profit || 0);
-        const won = r.status === 'won' || profit > 0;
-        if (t.mirrorOf) {
-          pendingTrades.splice(pendingTrades.indexOf(t), 1);
-          return sendTelegram('🪞 Mirror ' + (won ? '*WIN*' : '*LOSS*') + ' — ' + md(t.display) + ' ' + md(t.action) + ' · ' + md(profit.toFixed(2)));
-        }
-        if (won) dailyWins++; else dailyLosses++;
-        recordResult(won, profit);
-        pendingTrades.splice(pendingTrades.indexOf(t), 1);
-        const closedRow = {
-          contract_id: String(t.contractId), symbol: t.symbol, action: t.action,
-          votes: t.votes || {}, won: won, profit: profit, closed_at: new Date().toISOString(),
-        };
-        memLog.unshift(closedRow);
-        if (memLog.length > 500) memLog.pop();
-        dbCloseTrade(String(t.contractId), { won: won, profit: profit, closed_at: closedRow.closed_at });
-        closedSinceLearn++;
-        if (closedSinceLearn >= RECOMPUTE_EVERY) { closedSinceLearn = 0; learn(true); }
-        return sendTelegram(
-          (won ? '✅ *WIN*' : '❌ *LOSS*') + ' — ' + md(t.display) + ' ' + md(t.action) + '\n' +
-          'Profit: ' + md(profit.toFixed(2)) + '\n' +
-          'Total: ' + md(dailyWins) + 'W/' + md(dailyLosses) + 'L'
-        );
-      }).catch(function (e) { console.error('Check failed: ' + e.message); });
-    });
-  }, Promise.resolve());
-}
-
 function maybeDailySummary() {
   const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Africa/Lusaka' });
   if (lusakaHour() === 8 && lastSummaryDate !== today) {
@@ -447,4 +412,73 @@ function dispatchSignalInner() {
     return place(valid[0]);
   });
 }
+
+function tick() {
+  if (!botRunning || scanning) return;
+  scanning = true;
+  Promise.resolve()
+    .then(checkPendingTrades)
+    .then(checkCapitalTrades)
+    .then(maybeDailySummary)
+    .then(dispatchSignal)
+    .then(function () { return ensureNews().then(maybeNewsTrade); })
+    .then(maybeEvolvedTrade)
+    .then(maybeSmcTrade)
+    .then(mirrorSync)
+    .then(maybeForward)
+    .then(maybeForwardWeekly)
+    .catch(function (e) { console.error('Tick error: ' + e.message); })
+    .then(function () { scanning = false; });
+}
+
+function startBot(announce) {
+  if (botRunning) return false;
+  botRunning = true;
+  if (loopTimer) clearInterval(loopTimer);
+  loopTimer = setInterval(tick, 60000);
+  tick();
+  if (announce) {
+    const s = getSession();
+    sendTelegram(
+      '🤖 *ForexPulse PRO running*\n\n' +
+      '✅ Real Deriv candles, RSI \\+ MACD \\+ MA20\n' +
+      '✅ Runs on the server, not your phone\n' +
+      (autoTrade ? '🤖 Auto\\-trading: *ON*' : '✋ Auto\\-trading: *OFF* \\(manual signals\\)') + '\n\n' +
+      '📱 /status /stop /auto on /auto off /balance\n\n' +
+      s.emoji + ' ' + md(s.message)
+    );
+  }
+  return true;
+}
+
+function stopBot() {
+  if (!botRunning) return false;
+  botRunning = false;
+  if (loopTimer) { clearInterval(loopTimer); loopTimer = null; }
+  return true;
+}
+
+function botStatus() {
+  return {
+    running: botRunning,
+    autoTrade: autoTrade,
+    signalCount: signalCount,
+    dailyWins: dailyWins,
+    dailyLosses: dailyLosses,
+    openTrades: pendingTrades.length,
+    mt5Connected: false,
+    derivConnected: !!(DERIV_API_TOKEN && DERIV_ACCOUNT_ID),
+    recentSignals: recentSignals,
+    message: botRunning
+      ? 'Running — ' + signalCount + ' signals' + (autoTrade ? ' (auto-trading)' : '')
+      : 'Bot stopped',
+  };
+}
+
+// ---------- Backtest ----------
+// Replays the strategies on past 1-minute candles and counts wins.
+// Trades never overlap (after a trade, skip until it would have ended).
+
+let backtesting = false;
+const BT_LENGTHS = [5, 15];
 
