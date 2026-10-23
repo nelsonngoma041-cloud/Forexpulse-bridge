@@ -239,3 +239,124 @@ function volReport() {
     '\nUse /volatile on, /volatile off, or /volatiletest.';
 }
 
+function runVolatileTest() {
+  if (!CAP_ON) return Promise.reject(new Error('Capital.com keys are missing.'));
+  const errors = [];
+  const MULTS = [1.5, 2.0];
+  const strats = ST_STRATS;
+  // acc[mult][strat] -> [train, val, oos]
+  const acc = {};
+  MULTS.forEach(function (m) {
+    acc[m] = {};
+    strats.forEach(function (s) { acc[m][s[0]] = [stNewAcc(), stNewAcc(), stNewAcc()]; });
+  });
+  const allRows = [];
+  let used = [], bars = 0, hoursVol = 0, hoursAll = 0;
+  return ST_MARKETS.reduce(function (chain, sym) {
+    return chain.then(function () {
+      return stFetchHistory(sym, STRAT_PAGES, errors).then(function (b) {
+        if (b.length < 1000) { errors.push(sym + ': only ' + b.length + ' bars'); return null; }
+        used.push(sym); bars += b.length;
+        const D = stBuild(b);
+        const split = [Math.floor(D.n * 0.5), Math.floor(D.n * 0.75)];
+        for (let i = ST_WARM; i < D.n; i++) { hoursAll++; if (stIsVol(D, i, 1.5)) hoursVol++; }
+        strats.forEach(function (s, si) {
+          const sig = stSignals(s[0], D, 1000 + si * 77 + sym.length);
+          MULTS.forEach(function (m) {
+            const g = new Array(sig.length);
+            for (let i = 0; i < sig.length; i++) g[i] = (i >= ST_WARM && sig[i] !== 0 && stIsVol(D, i, m)) ? sig[i] : 0;
+            const rows = m === 1.5 ? [] : null;
+            stSim(D, g, ST_VARIANTS[0], split, acc[m][s[0]], { overlap: 0, wideSpread: 0, noAtr: 0 }, rows, null, sym, s[1]);
+            if (rows) rows.forEach(function (r) { allRows.push(r); });
+          });
+        });
+        return new Promise(function (r) { setImmediate(r); });
+      });
+    });
+  }, Promise.resolve()).then(function () {
+    if (!used.length) throw new Error('No history could be loaded. ' + (errors[0] || ''));
+    const msgs = [];
+    msgs.push(['🌪 *' + md('Volatile-market test') + '*',
+      md(used.length + ' markets, ' + bars + ' hourly bars. Only signals taken while hourly ATR is above 1.5x (and 2.0x) its 100-hour average. Same costs, stops (SL1.5 RR2) and train / validation / out-of-sample split as /strategytest.'),
+      md('Volatile hours: ' + Math.round(100 * hoursVol / Math.max(1, hoursAll)) + '% of all hours (at 1.5x).')].join('\n'));
+    const out = [];
+    let lead = false;
+    MULTS.forEach(function (m) {
+      out.push('*' + md('ATR above ' + m + 'x: net R per trade, train | validation | out-of-sample') + '*');
+      const pool = [stNewAcc(), stNewAcc(), stNewAcc()];
+      strats.forEach(function (s) {
+        const a = acc[m][s[0]];
+        if (s[0] !== 'rand') for (let p = 0; p < 3; p++) { pool[p].n += a[p].n; pool[p].w += a[p].w; pool[p].sumR += a[p].sumR; pool[p].gp += a[p].gp; pool[p].gl += a[p].gl; }
+        const f = function (x) { return x.n ? stF(stExp(x)) : 'none'; };
+        out.push(md(s[1] + ': ' + f(a[0]) + ' | ' + f(a[1]) + ' | ' + f(a[2]) + '  (n ' + a[0].n + '/' + a[1].n + '/' + a[2].n + ')'));
+      });
+      const r = acc[m].rand;
+      const pe = pool.map(stExp);
+      const enough = pool[0].n >= 60 && pool[1].n >= 30 && pool[2].n >= 30;
+      const good = enough && pe[0] >= 0.05 && pe[1] >= 0.05 && pe[2] >= 0.05 && stPF(pool[2]) >= 1.15 && pe[2] - stExp(r[2]) >= 0.05;
+      if (good) lead = true;
+      out.push(md('All 15 strategies pooled: ' + stF(pe[0]) + ' | ' + stF(pe[1]) + ' | ' + stF(pe[2]) + ' (n ' + pool[0].n + '/' + pool[1].n + '/' + pool[2].n + '), OOS PF ' + stPF(pool[2]).toFixed(2) + '. Random control OOS ' + stF(stExp(r[2])) + ' (n ' + r[2].n + '). ' + (enough ? (good ? 'LEAD ✅' : 'no edge') : 'too few trades to say')));
+      out.push(md('Pooled trades overlap in time, so they are not independent.'));
+      out.push('');
+    });
+    msgs.push(out.join('\n'));
+    msgs.push(lead
+      ? '*' + md('A lead was found. It is one test period, so confirm it with /volatile on for several weeks on demo before trusting it.') + '*'
+      : '*' + md('Verdict: trading only in volatile conditions does not give a proven edge in this data. Samples are small, so this is also not proof it never works.') + '*');
+    return { msgs: msgs, rows: allRows };
+  });
+}
+
+// ---------- Strategy search: the bot builds and tests its own rules ----------
+// /strategysearch combines simple conditions (trend, RSI, MACD, breakouts, hours...) into rules,
+// evolves them on the TRAIN period only, picks finalists using the VALIDATION period, and tests
+// the finalists once on the untouched OUT-OF-SAMPLE period. Only rules that pass every check
+// are saved as "evolved" strategies. /evolved on lets the bot trade them on the Capital.com demo.
+// The result can be "nothing found". That is an honest answer.
+
+let evoRunning = false;
+let evoOn = false;
+let evoWinners = [];           // [{ id, c: [cond ids], m: 1|-1, name }]
+const evoStats = { n: 0, w: 0, sum: 0 };
+const evoSeen = {};            // market:hour already checked live
+const EVO_POP = Number(process.env.EVO_POP || 80);
+const EVO_GENS = Number(process.env.EVO_GENS || 10);
+const EVO_SL = 1.5, EVO_RR = 2;
+const EVO_HOLD_MIN = ST_MAXHOLD * 60;
+
+// condition value at bar i: 1 = bullish only, -1 = bearish only, 2 = true for both sides, 0 = neither
+const EVO_CONDS = [
+  ['Price vs EMA200', function (D, i) { return D.c[i] > D.ema200[i] ? 1 : (D.c[i] < D.ema200[i] ? -1 : 0); }],
+  ['EMA20 vs EMA50', function (D, i) { return D.ema20[i] > D.ema50[i] ? 1 : (D.ema20[i] < D.ema50[i] ? -1 : 0); }],
+  ['4h trend', function (D, i) { return D.h4up[i]; }],
+  ['RSI extreme 30/70', function (D, i) { return D.rsi[i] < 30 ? 1 : (D.rsi[i] > 70 ? -1 : 0); }],
+  ['RSI zone 40/60', function (D, i) { return D.rsi[i] < 40 ? 1 : (D.rsi[i] > 60 ? -1 : 0); }],
+  ['RSI vs 50', function (D, i) { return D.rsi[i] > 50 ? 1 : (D.rsi[i] < 50 ? -1 : 0); }],
+  ['MACD histogram sign', function (D, i) { return D.hist[i] > 0 ? 1 : (D.hist[i] < 0 ? -1 : 0); }],
+  ['MACD histogram rising', function (D, i) { return D.hist[i] > D.hist[i - 1] ? 1 : (D.hist[i] < D.hist[i - 1] ? -1 : 0); }],
+  ['ADX above 20', function (D, i) { return D.adx[i] > 20 ? 2 : 0; }],
+  ['ADX below 20', function (D, i) { return D.adx[i] < 20 ? 2 : 0; }],
+  ['ATR rising', function (D, i) { return D.atr[i] > D.atr[i - 5] ? 2 : 0; }],
+  ['Volatile (ATR 1.5x)', function (D, i) { return stIsVol(D, i, 1.5) ? 2 : 0; }],
+  ['Close outside Bollinger (trend)', function (D, i) { return D.c[i] > D.bbU[i] ? 1 : (D.c[i] < D.bbL[i] ? -1 : 0); }],
+  ['Close outside Bollinger (revert)', function (D, i) { return D.c[i] < D.bbL[i] ? 1 : (D.c[i] > D.bbU[i] ? -1 : 0); }],
+  ['Donchian 20 breakout', function (D, i) { return D.c[i] > D.dHi[i] ? 1 : (D.c[i] < D.dLo[i] ? -1 : 0); }],
+  ['Pullback to EMA50', function (D, i) {
+    if (D.l[i] <= D.ema50[i] + 0.5 * D.atr[i] && D.c[i] > D.ema50[i]) return 1;
+    if (D.h[i] >= D.ema50[i] - 0.5 * D.atr[i] && D.c[i] < D.ema50[i]) return -1;
+    return 0; }],
+  ['Candle direction', function (D, i) { return D.c[i] > D.o[i] ? 1 : (D.c[i] < D.o[i] ? -1 : 0); }],
+  ['Strong candle body', function (D, i) {
+    const r = D.h[i] - D.l[i]; if (!(r > 0)) return 0;
+    if (Math.abs(D.c[i] - D.o[i]) / r < 0.6) return 0;
+    return D.c[i] > D.o[i] ? 1 : -1; }],
+  ['London and New York hours', function (D, i) { const h = new Date(D.bars[i].t).getUTCHours(); return h >= 7 && h < 17 ? 2 : 0; }],
+  ['Asian hours', function (D, i) { const h = new Date(D.bars[i].t).getUTCHours(); return h < 7 ? 2 : 0; }],
+  ['Ichimoku cloud', function (D, i) { return D.c[i] > D.cloudTop[i] ? 1 : (D.c[i] < D.cloudBot[i] ? -1 : 0); }],
+  ['Previous-day break', function (D, i) { return D.c[i] > D.pdH[i] ? 1 : (D.c[i] < D.pdL[i] ? -1 : 0); }],
+  ['Price vs Kijun', function (D, i) { return D.c[i] > D.kijun[i] ? 1 : (D.c[i] < D.kijun[i] ? -1 : 0); }],
+  ['Momentum bar (1 ATR)', function (D, i) { const d = D.c[i] - D.c[i - 1]; return d > D.atr[i] ? 1 : (d < -D.atr[i] ? -1 : 0); }],
+  ['10-bar breakout', function (D, i) { return D.c[i] > D.p10Hi[i] ? 1 : (D.c[i] < D.p10Lo[i] ? -1 : 0); }],
+  ['5-bar momentum', function (D, i) { return D.c[i] > D.c[i - 5] ? 1 : (D.c[i] < D.c[i - 5] ? -1 : 0); }],
+];
+
