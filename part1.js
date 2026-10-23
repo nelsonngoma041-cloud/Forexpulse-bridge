@@ -483,3 +483,13 @@ function capEpic(symbol) {
   });
 }
 
+// Recent 1-minute closes from Capital.com, for the signal analysis
+function capCloses(epic) {
+  return capCall('GET', '/prices/' + epic + '?resolution=MINUTE&max=100').then(function (j) {
+    return (j.prices || []).map(function (x) { return (Number(x.closePrice.bid) + Number(x.closePrice.ask)) / 2; });
+  });
+}
+
+let capTokens = null;      // { cst, sec, at }
+let capLastLogin = 0;
+
