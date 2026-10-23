@@ -1,42 +1,3 @@
-function stIsVol(D, i, mult) {
-  let sum = 0, cnt = 0;
-  for (let k = Math.max(0, i - 100); k <= i; k++) { if (D.atr[k] > 0) { sum += D.atr[k]; cnt++; } }
-  const avg = cnt ? sum / cnt : D.atr[i];
-  return D.atr[i] > mult * avg;
-}
-
-// Live check for one Capital.com market
-function volatileNow(symbol) {
-  return capEpic(symbol).then(function (epic) {
-    return capCall('GET', '/prices/' + epic + '?resolution=HOUR&max=130');
-  }).then(function (j) {
-    const p = j.prices || [];
-    const mid = function (o) { return (Number(o.bid) + Number(o.ask)) / 2; };
-    if (p.length < 120) return { ok: false, ratio: 0 };
-    const tr = [];
-    for (let i = 1; i < p.length; i++) {
-      const h = mid(p[i].highPrice), l = mid(p[i].lowPrice), pc = mid(p[i - 1].closePrice);
-      tr.push(Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc)));
-    }
-    const atrAt = function (end) { let s = 0; for (let k = end - 13; k <= end; k++) s += tr[k]; return s / 14; };
-    const now = atrAt(tr.length - 1);
-    let s2 = 0, c2 = 0;
-    for (let e = tr.length - 100; e < tr.length; e++) { s2 += atrAt(e); c2++; }
-    const ratio = now / (s2 / c2);
-    return { ok: ratio > VOL_MULT, ratio: ratio };
-  });
-}
-
-function volLearn(t, profit) {
-  volStats.n++; volStats.sum += profit; if (profit > 0) volStats.w++;
-}
-
-function volReport() {
-  return '🌪 Volatile mode: ' + (volatileMode ? 'ON' : 'OFF') + ' (hourly ATR above ' + VOL_MULT + 'x its 100-hour average)\n' +
-    (volStats.n ? 'Closed volatile-mode trades: ' + volStats.n + ', wins ' + volStats.w + ', net $' + volStats.sum.toFixed(2) : 'No volatile-mode trades closed yet.') +
-    '\nUse /volatile on, /volatile off, or /volatiletest.';
-}
-
 function runVolatileTest() {
   if (!CAP_ON) return Promise.reject(new Error('Capital.com keys are missing.'));
   const errors = [];
@@ -333,9 +294,73 @@ function evoLiveBars(symbol) {
   return capEpic(symbol).then(function (epic) { return capCall('GET', '/prices/' + epic + '?resolution=HOUR&max=300'); }).then(function (j) {
     const m = function (o) { return (Number(o.bid) + Number(o.ask)) / 2; };
     const arr = (j.prices || []).map(function (x) {
-      return { t: Date.parse((x.snapshotTimeUTC || x.snapshotTime) + 'Z'), o: m(x.openPrice), h: m(x.highPrice), l: m(x.lowPrice), c: m(x.closePrice), sp: Math.abs(Number(x.openPrice.ask) - Number(x.openPrice.bid)) };
+      return { t: Date.parse((x.snapshotTimeUTC || x.snapshotTime) + 'Z'), o: m(x.openPrice), h: m(x.highPrice), l: m(x.lowPrice), c: m(x.closePrice), sp: Math.abs(Number(x.openPrice.ask) - Number(x.openPrice.bid)), v: Number(x.lastTradedVolume) || 0 };
     }).filter(function (b) { return !isNaN(b.t) && b.h > 0; }).sort(function (a, b) { return a.t - b.t; });
     return arr;
   });
 }
+
+function maybeEvolvedTrade() {
+  if (!evoOn || !evoWinners.length || !autoTrade || !CAP_ON || tradeBroker === 'deriv' || circuitOpen) return Promise.resolve();
+  const now = new Date();
+  if (now.getUTCMinutes() < 1 || now.getUTCMinutes() > 20) return Promise.resolve();   // act just after the hour closes
+  const hourId = Math.floor(now.getTime() / 3600000);
+  return ST_MARKETS.reduce(function (chain, sym) {
+    return chain.then(function () {
+      const key = sym + ':' + hourId;
+      if (evoSeen[key]) return null;
+      evoSeen[key] = true;
+      const pair = PAIRS.filter(function (p) { return p.symbol === sym; })[0];
+      if (!pair || pendingTrades.some(function (t) { return t.display === pair.display; }) || openCount() >= 6) return null;
+      if (newsBlock(sym)) return null;
+      return evoLiveBars(sym).then(function (bars) {
+        if (bars.length < 260) return null;
+        const D = stBuild(bars);
+        const i = D.n - 2;   // last completed hour
+        if (Date.now() - bars[i].t > 2.5 * 3600000) return null;   // stale data
+        if (D.medSp > 0 && D.sp[D.n - 1] > 3 * D.medSp) return null;
+        let hit = null, dir = 0;
+        for (let q = 0; q < evoWinners.length && !hit; q++) {
+          const s = evoSignalAt(D, evoWinners[q], i);
+          if (s !== 0) { hit = evoWinners[q]; dir = s; }
+        }
+        if (!hit || !(D.atr[i] > 0)) return null;
+        const action = dir > 0 ? 'BUY' : 'SELL';
+        return capitalTrade(sym, action, { sl: EVO_SL * D.atr[i], rr: EVO_RR }).then(function (t) {
+          tradesToday++;
+          pendingTrades.push({
+            contractId: t.dealId, display: pair.display, symbol: sym, action: action,
+            placedAt: Date.now(), votes: {}, minutes: EVO_HOLD_MIN, holdMin: EVO_HOLD_MIN, broker: 'capital', evoId: hit.id,
+          });
+          dbInsertTrade({
+            contract_id: String(t.dealId), symbol: sym, action: action, confidence: 0, votes: {}, rsi: 0,
+            hour: lusakaHour(), stake: Number(t.riskUsd.toFixed(2)), demo: true,
+          });
+          return sendTelegram(
+            '🧬 *EVOLVED TRADE — ' + md(pair.display) + '* \\(Capital demo\\)\n\n' +
+            md(hit.name) + '\n' + md(action) + ' · size ' + md(t.size) + ' · risk about $' + md(t.riskUsd.toFixed(2)) + '\n' +
+            'Stop loss: ' + md(t.sl.toPrecision(4)) + ' away · Take profit: ' + md(t.tp.toPrecision(4)) + ' away'
+          );
+        });
+      }).catch(function (e) { console.log('Evolved ' + sym + ': ' + e.message); return null; });
+    });
+  }, Promise.resolve());
+}
+
+// ---------- Market-structure ("smart money") strategies from the videos ----------
+// Swing highs and lows are confirmed 3 bars late, so nothing looks into the future.
+//  BOS = a close beyond the last swing high (up) or swing low (down).
+//  FVG = a 3-candle gap left by a strong move. Entry when price returns into it.
+// Strategy 'fvg':    after a BOS, buy the pullback into the FVG; stop just beyond the FVG;
+//                    target = the impulse extreme. (Video 2. The inducement step is left out.)
+// Strategy 'struct': after a BOS, buy the pullback into the discount half (below 50% of the
+//                    move) with a candle in our direction; stop beyond the strong low; target = impulse extreme. (Video 1)
+// Both need a reward of at least 1.5x the risk. Shorts are the mirror image.
+// /smctest tests them like every other idea. Rules that pass can be saved and traded with /smc on.
+
+let smcRunning = false, smcOn = false;
+let smcWinners = [];           // ['fvg'] and/or ['struct']
+const smcStats = { n: 0, w: 0, sum: 0 };
+const SMC_NAMES = { fvg: 'Structure break + FVG pullback', struct: 'Structure break + discount pullback' };
+const SMC_MIN_RR = 1.5;
 
