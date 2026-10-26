@@ -60,7 +60,25 @@ function pocFrp(D, a, b) {                      // point of control over bars a.
   return mn + best * w + w / 2;
 }
 
-function stPocSignals(D) {
+// candle anatomy of bar i (hammer / shooting star / engulfing), as in the Python candle_reader
+function pocPat(D, i) {
+  const o = D.o[i], h = D.h[i], l = D.l[i], c = D.c[i];
+  const rng = Math.max(h - l, 1e-12), body = Math.abs(c - o);
+  const upper = h - Math.max(o, c), lower = Math.min(o, c) - l, cp = (c - l) / rng;
+  const po = D.o[i - 1], pc = D.c[i - 1], pb = Math.abs(pc - po);
+  return {
+    cp: cp, bullish: c > o, bearish: c < o,
+    hammer: lower >= 2 * body && upper / rng <= 0.35 && cp >= 0.55,
+    star: upper >= 2 * body && lower / rng <= 0.35 && cp <= 0.45,
+    bullEng: pc < po && c > o && c >= po && o <= pc && body > pb,
+    bearEng: pc > po && c < o && c <= po && o >= pc && body > pb,
+  };
+}
+
+// confirm = true: the "candle confirmation" version. A trade needs 4 of 5 points: PoC tapped and held,
+// a hammer / engulfing candle, a strong close, volume above 1.2x its 20-bar average, and the EMA50/EMA200 trend agreeing.
+// Exits are 1.5 ATR stop and 3 ATR target.
+function stPocSignals(D, confirm) {
   const n = D.n, h = D.h, l = D.l, c = D.c, o = D.o;
   const sig = new Int8Array(n), slA = new Float64Array(n), tpA = new Float64Array(n);
   for (let i = POC.scan; i < n; i++) {
@@ -107,6 +125,30 @@ function stPocSignals(D) {
     const tol = POC.tol * cand.atr, rng = Math.max(h[i] - l[i], 1e-12);
     const aa = D.atr[i];
     if (!(aa > 0)) continue;
+    if (confirm) {
+      const pp = pocPat(D, i);
+      let vs = 0;
+      for (let k = i - 19; k <= i; k++) vs += D.bars[k].v || 0;
+      const vexp = (D.bars[i].v || 0) >= 1.2 * (vs / 20) && vs > 0;
+      if (cand.dir > 0) {
+        if (!(l[i] <= poc + tol && c[i] >= poc - tol)) continue;
+        let sc = 1;
+        if (pp.hammer || pp.bullEng) sc++;
+        if (pp.cp >= 0.6 && pp.bullish) sc++;
+        if (vexp) sc++;
+        if (D.ema50[i] > D.ema200[i] && c[i] > D.ema200[i]) sc++;
+        if (sc >= 4) { sig[i] = 1; slA[i] = c[i] - 1.5 * aa; tpA[i] = c[i] + 3 * aa; }
+      } else {
+        if (!(h[i] >= poc - tol && c[i] <= poc + tol)) continue;
+        let sc = 1;
+        if (pp.star || pp.bearEng) sc++;
+        if (pp.cp <= 0.4 && pp.bearish) sc++;
+        if (vexp) sc++;
+        if (D.ema50[i] < D.ema200[i] && c[i] < D.ema200[i]) sc++;
+        if (sc >= 4) { sig[i] = -1; slA[i] = c[i] + 1.5 * aa; tpA[i] = c[i] - 3 * aa; }
+      }
+      continue;
+    }
     if (cand.dir > 0) {
       if (c[i - 1] <= poc) continue;
       let ok = false;
@@ -132,7 +174,7 @@ function stPocSignals(D) {
   return { sig: sig, sl: slA, tp: tpA };
 }
 
-function runPocTest() {
+function runPocTest(confirm) {
   if (!CAP_ON) return Promise.reject(new Error('Capital.com keys are missing.'));
   const errors = [], rows = [];
   const acc = [stNewAcc(), stNewAcc(), stNewAcc()], ctl = [stNewAcc(), stNewAcc(), stNewAcc()], per = [];
@@ -145,7 +187,7 @@ function runPocTest() {
         used++;
         const D = stBuild(b);
         const split = [Math.floor(D.n * 0.5), Math.floor(D.n * 0.75)];
-        const S = stPocSignals(D);
+        const S = stPocSignals(D, confirm);
         const a = [stNewAcc(), stNewAcc(), stNewAcc()];
         stSimLv(D, S, split, a, rows, sym, 'poc');
         const c = [stNewAcc(), stNewAcc(), stNewAcc()];
@@ -165,10 +207,10 @@ function runPocTest() {
     if (acc[0].n < 30 || acc[1].n < 30 || acc[2].n < 30) verdict = 'too few trades';
     else if (exps[0] >= 0.05 && exps[1] >= 0.05 && exps[2] >= 0.05 && stPF(acc[2]) >= 1.15 && t >= 2 && exps[2] - stExp(ctl[2]) >= 0.05 && posM >= Math.ceil(used * 2 / 3)) verdict = 'PASS ✅';
     else verdict = 'fail';
-    const m1 = ['📊 *' + md('Volume-profile PoC retest test') + '*',
-      md(used + ' markets, hourly. Box of 20 bars, breakout, 1.5 ATR move, profile of the move, entry on the PoC retest. Stop beyond the zone, target at the move extreme, reward at least ' + SMC_MIN_RR + 'x risk. Real spread + ' + STRAT_SLIP + 'x slippage. Same train / validation / out-of-sample split.'),
+    const m1 = ['📊 *' + md(confirm ? 'PoC retest + candle confirmation test' : 'Volume-profile PoC retest test') + '*',
+      md(used + ' markets, hourly. Box of 20 bars, breakout, 1.5 ATR move, profile of the move, entry on the PoC retest. ' + (confirm ? 'Needs 4 of 5: PoC held, hammer or engulfing candle, strong close, volume 1.2x average, EMA50/200 trend agrees. Stop 1.5 ATR, target 3 ATR. ' : 'Stop beyond the zone, target at the move extreme, reward at least ' + SMC_MIN_RR + 'x risk. ') + 'Real spread + ' + STRAT_SLIP + 'x slippage. Same train / validation / out-of-sample split.'),
       md('Volume here is Capital.com tick count, not real exchange volume, so this is a proxy of your strategy.')].join('\n');
-    const m2 = [md('Wyckoff PoC retest'),
+    const m2 = [md(confirm ? 'PoC retest + candle confirmation' : 'Wyckoff PoC retest'),
       md('  net R per trade: train ' + stF(exps[0]) + ' | validation ' + stF(exps[1]) + ' | out-of-sample ' + stF(exps[2]) + '  (n ' + acc[0].n + '/' + acc[1].n + '/' + acc[2].n + ')'),
       md('  OOS PF ' + stPF(acc[2]).toFixed(2) + ', win ' + (acc[2].n ? Math.round(100 * acc[2].w / acc[2].n) : 0) + '%, t ' + t.toFixed(1) + ', max DD ' + dd.toFixed(1) + 'R, ' + posM + '/' + used + ' markets positive'),
       md('  random control: ' + stF(stExp(ctl[0])) + ' | ' + stF(stExp(ctl[1])) + ' | ' + stF(stExp(ctl[2])) + ' -> ' + verdict)].join('\n');
@@ -186,7 +228,7 @@ const FW_NAMES = (function () {
   ST_STRATS.forEach(function (s) { if (s[0] !== 'rand') o[s[0]] = s[1]; });
   PAT_CANDLE.forEach(function (p) { o['c_' + p[0]] = p[1]; });
   PAT_CHART.forEach(function (p) { o['p_' + p[0]] = p[1]; });
-  o.m_poc = 'Wyckoff volume-profile PoC retest'; o.m_fvg = SMC_NAMES.fvg; o.m_struct = SMC_NAMES.struct;
+  o.m_poc = 'Wyckoff volume-profile PoC retest'; o.m_poc2 = 'PoC retest + candle confirmation'; o.m_fvg = SMC_NAMES.fvg; o.m_struct = SMC_NAMES.struct;
   return o;
 })();
 
@@ -286,6 +328,7 @@ function fwNewSignals(sym, D, bars) {
   PAT_CHART.forEach(function (p) { try { const S = patChart(D, p[0]); if (S.sig[i]) add('p_' + p[0], S.sig[i], S.sl[i], S.tp[i]); } catch (err) { /* skip */ } });
   ['fvg', 'struct'].forEach(function (k) { try { const S = stSmcSignals(D, k); if (S.sig[i]) add('m_' + k, S.sig[i], S.sl[i], S.tp[i]); } catch (err) { /* skip */ } });
   try { const S = stPocSignals(D); if (S.sig[i]) add('m_poc', S.sig[i], S.sl[i], S.tp[i]); } catch (err) { /* skip */ }
+  try { const S2 = stPocSignals(D, true); if (S2.sig[i]) add('m_poc2', S2.sig[i], S2.sl[i], S2.tp[i]); } catch (err) { /* skip */ }
   return out;
 }
 
@@ -320,13 +363,5 @@ function maybeForward() {
     if (cl.length > FW_MAX_CLOSED) { const drop = {}; cl.slice(0, cl.length - FW_MAX_CLOSED).forEach(function (r) { drop[r.id] = true; }); fwRecs = fwRecs.filter(function (r) { return !drop[r.id]; }); }
     console.log('Forward tracker: +' + added + ' signals, ' + closed + ' closed, ' + fwRecs.length + ' records');
   });
-}
-
-function fwAgg(list) {
-  const a = { n: 0, w: 0, sum: 0, gp: 0, gl: 0 };
-  list.forEach(function (r) { a.n++; a.sum += r.r; if (r.r > 0) { a.w++; a.gp += r.r; } else a.gl += -r.r; });
-  a.pf = a.gl > 0 ? a.gp / a.gl : (a.gp > 0 ? 99 : 0);
-  a.exp = a.n ? a.sum / a.n : 0;
-  return a;
 }
 
