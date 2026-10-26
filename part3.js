@@ -268,8 +268,12 @@ function dispatchSignalInner() {
       if (pendingTrades.some(function (t) { return t.display === pair.display; })) return null;
       if (openCount() >= (tradeBroker === 'both' ? 6 : MAX_OPEN_TRADES)) return null;
       if (tradeBroker !== 'deriv' && pair.type !== 'derived') {
-        const gate = volatileMode ? volatileNow(pair.symbol).catch(function () { return { ok: false, ratio: 0 }; }) : Promise.resolve({ ok: true });
+        const gate = (volatileMode ? volatileNow(pair.symbol).catch(function () { return { ok: false, ratio: 0 }; }) : Promise.resolve({ ok: true })).then(function (vg) {
+          if (!vg.ok) return vg;
+          return gateCheck(pair.symbol, a.action, pair.display).then(function (g) { return g.ok ? vg : { ok: false, ratio: 0, gated: true }; });
+        });
         return gate.then(function (vg) {
+          if (!vg.ok && vg.gated) return null;
           if (!vg.ok) { console.log('Volatile mode: skip ' + pair.symbol + ' (ratio ' + (vg.ratio || 0).toFixed(2) + ')'); return null; }
           return capitalTrade(pair.symbol, a.action).then(function (t) {
           signalCount++;
@@ -443,4 +447,58 @@ function botStatus() {
 
 let backtesting = false;
 const BT_LENGTHS = [5, 15];
+
+function comboVote(votes) {
+  let nBuy = 0, nSell = 0;
+  STRATEGIES.forEach(function (k) {
+    if (votes[k] > 0) nBuy++; else if (votes[k] < 0) nSell++;
+  });
+  const conf = function (d) { return Math.min(95, Math.round(50 + 50 * d / STRATEGIES.length)); };
+  if (nBuy >= MIN_AGREE && nBuy > nSell && conf(nBuy - nSell) >= MIN_CONFIDENCE) return 1;
+  if (nSell >= MIN_AGREE && nSell > nBuy && conf(nSell - nBuy) >= MIN_CONFIDENCE) return -1;
+  return 0;
+}
+
+// data: { SYMBOLKEY: [close, close, ...] }  ->  stats per trade length
+function backtestFromData(data) {
+  const out = {};
+  BT_LENGTHS.forEach(function (N) {
+    const st = { strat: {}, pairs: {} };
+    STRATEGIES.concat(['combo']).forEach(function (k) { st.strat[k] = { n: 0, w: 0 }; });
+    out[N] = st;
+  });
+
+  Object.keys(data).forEach(function (sym) {
+    const prices = data[sym];
+    if (prices.length < 120) return;
+    const votesAt = [];
+    for (let i = 79; i < prices.length; i++) {
+      votesAt[i] = getVotes(prices.slice(i - 79, i + 1)).votes;
+    }
+    BT_LENGTHS.forEach(function (N) {
+      STRATEGIES.concat(['combo']).forEach(function (k) {
+        let i = 79;
+        while (i < prices.length - N) {
+          const v = k === 'combo' ? comboVote(votesAt[i]) : votesAt[i][k];
+          if (v !== 0) {
+            const up = prices[i + N] > prices[i];
+            const down = prices[i + N] < prices[i];
+            const won = (v > 0 && up) || (v < 0 && down);
+            out[N].strat[k].n++;
+            if (won) out[N].strat[k].w++;
+            if (k === 'combo') {
+              const p = out[N].pairs[sym] || (out[N].pairs[sym] = { n: 0, w: 0 });
+              p.n++;
+              if (won) p.w++;
+            }
+            i += N;
+          } else {
+            i++;
+          }
+        }
+      });
+    });
+  });
+  return out;
+}
 
