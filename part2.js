@@ -1,58 +1,3 @@
-function capLogin() {
-  if (!CAP_ON) return Promise.reject(new Error('Capital.com is not set up. Add CAPITAL_API_KEY, CAPITAL_API_PASSWORD, CAPITAL_EMAIL in Render.'));
-  const wait = Math.max(0, 1200 - (Date.now() - capLastLogin));   // limit: 1 login per second
-  return new Promise(function (r) { setTimeout(r, wait); }).then(function () {
-    capLastLogin = Date.now();
-    return fetch(CAP_BASE + '/session', {
-      method: 'POST',
-      headers: { 'X-CAP-API-KEY': CAP_KEY, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ identifier: CAP_EMAIL, password: CAP_PASS, encryptedPassword: false }),
-    });
-  }).then(function (r) {
-    if (!r.ok) {
-      return r.text().then(function (t) { throw new Error('Capital login ' + r.status + ': ' + t.slice(0, 160)); });
-    }
-    const cst = r.headers.get('cst');
-    const sec = r.headers.get('x-security-token');
-    if (!cst || !sec) throw new Error('Capital login gave no session tokens');
-    capTokens = { cst: cst, sec: sec, at: Date.now() };
-    return r.json().catch(function () { return {}; });
-  });
-}
-
-let capLoginP = null;
-function capEnsure() {
-  if (capTokens && Date.now() - capTokens.at < 8 * 60 * 1000) return Promise.resolve();
-  if (!capLoginP) {
-    capLoginP = capLogin().then(function () { capLoginP = null; }, function (e) { capLoginP = null; throw e; });
-  }
-  return capLoginP;
-}
-
-// method, path like '/positions', optional JSON body
-function capCall(method, path, body, retried) {
-  return capEnsure().then(function () { return capThrottle(); }).then(function () {
-    const opt = {
-      method: method,
-      headers: { 'X-SECURITY-TOKEN': capTokens.sec, CST: capTokens.cst, 'Content-Type': 'application/json' },
-    };
-    if (body) opt.body = JSON.stringify(body);
-    return fetch(CAP_BASE + path, opt);
-  }).then(function (r) {
-    if (r.status === 401 && !retried) { capTokens = null; return capCall(method, path, body, true); }
-    return r.text().then(function (t) {
-      let j = {};
-      try { j = JSON.parse(t); } catch (e) { j = { raw: t }; }
-      if (!r.ok) {
-        const err = new Error('Capital ' + r.status + ': ' + (j.errorCode || j.raw || t).toString().slice(0, 160));
-        err.status = r.status;
-        throw err;
-      }
-      return j;
-    });
-  });
-}
-
 function capBalance() {
   return capCall('GET', '/accounts').then(function (j) {
     const a = (j.accounts || []).filter(function (x) { return x.preferred; })[0] || (j.accounts || [])[0];
@@ -82,9 +27,10 @@ function capitalTrade(symbol, action, opts) {
 }
 
 function capitalTradeEpic(epic, action, opts) {
-  return Promise.all([capCall('GET', '/markets/' + epic), capAtr(epic)]).then(function (res) {
+  return Promise.all([capCall('GET', '/markets/' + epic), capAtr(epic), capRiskNow()]).then(function (res) {
     const m = res[0];
     const atr = res[1];
+    const risk = res[2];
     const snap = m.snapshot || {};
     if (snap.marketStatus && snap.marketStatus !== 'TRADEABLE') throw new Error('Market closed: ' + epic);
     const bid = Number(snap.bid), ask = Number(snap.offer);
@@ -101,10 +47,10 @@ function capitalTradeEpic(epic, action, opts) {
     const minSize = Number((rules.minDealSize || {}).value || 0.01);
     const step = Number((rules.minSizeIncrement || {}).value || minSize);
     const maxSize = Number((rules.maxDealSize || {}).value || 1e9);
-    let size = capRisk / sl;
+    let size = risk / sl;
     size = Math.floor(size / step) * step;
     size = Math.max(minSize, Math.min(maxSize, Number(size.toFixed(6))));
-    if (size * sl > capRisk * 2.5) throw new Error('Too big for your risk setting: ' + epic + ' (smallest trade would risk $' + (size * sl).toFixed(2) + ')');
+    if (size * sl > risk * 2.5) throw new Error('Too big for your risk setting: ' + epic + ' (smallest trade would risk $' + (size * sl).toFixed(2) + ')');
     const body = {
       epic: epic, direction: action === 'BUY' ? 'BUY' : 'SELL', size: size,
       stopDistance: Number(sl.toPrecision(6)), profitDistance: Number(tp.toPrecision(6)),
@@ -398,9 +344,9 @@ function recordResult(won, profit) {
   if (!circuitOpen && consecLosses >= MAX_CONSEC_LOSSES) {
     circuitOpen = true;
     circuitReason = consecLosses + ' losses in a row';
-  } else if (!circuitOpen && dayPnl <= -MAX_DAILY_LOSS) {
+  } else if (!circuitOpen && dayPnl <= -ddLimitNow()) {
     circuitOpen = true;
-    circuitReason = 'lost $' + Math.abs(dayPnl).toFixed(2) + ' today';
+    circuitReason = 'lost $' + Math.abs(dayPnl).toFixed(2) + ' today (limit $' + ddLimitNow().toFixed(2) + ')';
   }
   if (circuitOpen && !circuitNotified) {
     circuitNotified = true;
