@@ -493,3 +493,58 @@ function capCloses(epic) {
 let capTokens = null;      // { cst, sec, at }
 let capLastLogin = 0;
 
+function capLogin() {
+  if (!CAP_ON) return Promise.reject(new Error('Capital.com is not set up. Add CAPITAL_API_KEY, CAPITAL_API_PASSWORD, CAPITAL_EMAIL in Render.'));
+  const wait = Math.max(0, 1200 - (Date.now() - capLastLogin));   // limit: 1 login per second
+  return new Promise(function (r) { setTimeout(r, wait); }).then(function () {
+    capLastLogin = Date.now();
+    return fetch(CAP_BASE + '/session', {
+      method: 'POST',
+      headers: { 'X-CAP-API-KEY': CAP_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ identifier: CAP_EMAIL, password: CAP_PASS, encryptedPassword: false }),
+    });
+  }).then(function (r) {
+    if (!r.ok) {
+      return r.text().then(function (t) { throw new Error('Capital login ' + r.status + ': ' + t.slice(0, 160)); });
+    }
+    const cst = r.headers.get('cst');
+    const sec = r.headers.get('x-security-token');
+    if (!cst || !sec) throw new Error('Capital login gave no session tokens');
+    capTokens = { cst: cst, sec: sec, at: Date.now() };
+    return r.json().catch(function () { return {}; });
+  });
+}
+
+let capLoginP = null;
+function capEnsure() {
+  if (capTokens && Date.now() - capTokens.at < 8 * 60 * 1000) return Promise.resolve();
+  if (!capLoginP) {
+    capLoginP = capLogin().then(function () { capLoginP = null; }, function (e) { capLoginP = null; throw e; });
+  }
+  return capLoginP;
+}
+
+// method, path like '/positions', optional JSON body
+function capCall(method, path, body, retried) {
+  return capEnsure().then(function () { return capThrottle(); }).then(function () {
+    const opt = {
+      method: method,
+      headers: { 'X-SECURITY-TOKEN': capTokens.sec, CST: capTokens.cst, 'Content-Type': 'application/json' },
+    };
+    if (body) opt.body = JSON.stringify(body);
+    return fetch(CAP_BASE + path, opt);
+  }).then(function (r) {
+    if (r.status === 401 && !retried) { capTokens = null; return capCall(method, path, body, true); }
+    return r.text().then(function (t) {
+      let j = {};
+      try { j = JSON.parse(t); } catch (e) { j = { raw: t }; }
+      if (!r.ok) {
+        const err = new Error('Capital ' + r.status + ': ' + (j.errorCode || j.raw || t).toString().slice(0, 160));
+        err.status = r.status;
+        throw err;
+      }
+      return j;
+    });
+  });
+}
+
