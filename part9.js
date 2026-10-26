@@ -1,3 +1,11 @@
+function fwAgg(list) {
+  const a = { n: 0, w: 0, sum: 0, gp: 0, gl: 0 };
+  list.forEach(function (r) { a.n++; a.sum += r.r; if (r.r > 0) { a.w++; a.gp += r.r; } else a.gl += -r.r; });
+  a.pf = a.gl > 0 ? a.gp / a.gl : (a.gp > 0 ? 99 : 0);
+  a.exp = a.n ? a.sum / a.n : 0;
+  return a;
+}
+
 function fwReport() {
   const closed = fwRecs.filter(function (r) { return r.st === 'closed' && r.r !== null; });
   const open = fwRecs.filter(function (r) { return r.st === 'open'; }).length;
@@ -39,7 +47,7 @@ function maybeForwardWeekly() {
 let stateOk = true, stateLast = '';
 function stateSnap() {
   return JSON.stringify({
-    autoTrade: autoTrade, tradeBroker: tradeBroker, newsOn: newsOn, newsTrade: newsTrade, mirrorOn: mirrorOn, fwOn: fwOn,
+    autoTrade: autoTrade, tradeBroker: tradeBroker, newsOn: newsOn, newsTrade: newsTrade, mirrorOn: mirrorOn, fwOn: fwOn, gateOn: gateOn, capRiskPct: capRiskPct, ddPct: ddPct,
     ntStats: ntStats, ntMinAtr: ntMinAtr, ntAll: ntAll, pairResetAt: pairResetAt, pairPausedAt: pairPausedAt,
   });
 }
@@ -69,6 +77,9 @@ function stateLoad() {
     if (typeof v.newsTrade === 'boolean') newsTrade = v.newsTrade;
     if (typeof v.mirrorOn === 'boolean') mirrorOn = v.mirrorOn;
     if (typeof v.fwOn === 'boolean') fwOn = v.fwOn;
+    if (typeof v.gateOn === 'boolean') gateOn = v.gateOn;
+    if (isFinite(Number(v.capRiskPct)) && Number(v.capRiskPct) >= 0) capRiskPct = Number(v.capRiskPct);
+    if (isFinite(Number(v.ddPct)) && Number(v.ddPct) >= 0) ddPct = Number(v.ddPct);
     if (v.ntStats && typeof v.ntStats === 'object') Object.keys(v.ntStats).forEach(function (k) { ntStats[k] = v.ntStats[k]; });
     if (isFinite(Number(v.ntMinAtr)) && Number(v.ntMinAtr) > 0) ntMinAtr = Number(v.ntMinAtr);
     if (v.ntAll && typeof v.ntAll === 'object') ntAll = v.ntAll;
@@ -80,365 +91,284 @@ function stateLoad() {
 }
 setInterval(stateSave, 30000);
 
-function sendLong(text) {
-  if (text.length <= 3800) return sendTelegram(text);
-  const lines = text.split('\n');
-  let chunk = '', chain = Promise.resolve();
-  lines.forEach(function (ln) {
-    if ((chunk + '\n' + ln).length > 3800) { const c = chunk; chain = chain.then(function () { return sendTelegram(c); }); chunk = ln; }
-    else chunk = chunk ? chunk + '\n' + ln : ln;
+// ===== Market read before every Capital.com trade: reads the real hourly candles and can say "skip" =====
+// Not proven to improve results. It removes bad-looking entries (wide spread, dead or wild market, strong
+// counter-trend, exhausted move, no room to the day's high or low, opposite candle). Switch with /gate on|off.
+let gateOn = process.env.GATE !== 'off';
+const gateCache = {};
+const gateStats = { pass: 0, block: 0, why: {} };
+const gateNotified = {};
+
+function gateRead(symbol) {
+  const c = gateCache[symbol];
+  if (c && Date.now() - c.t < 5 * 60000) return Promise.resolve(c.D);
+  return fwBars(symbol).then(function (bars) {
+    if (bars.length < 260) throw new Error('only ' + bars.length + ' candles');
+    const D = stBuild(bars);
+    D._pc = {};
+    PAT_CANDLE.forEach(function (p) { D._pc[p[0]] = patCandle(D, p[0]); });
+    gateCache[symbol] = { t: Date.now(), D: D };
+    return D;
   });
-  return chain.then(function () { return sendTelegram(chunk); });
 }
 
-function handleTelegramCommand(text) {
-  const parts = String(text).trim().toLowerCase().split(/\s+/);
-  const cmd = parts[0].split('@')[0];
-  const arg = parts[1] || '';
+// returns { ok, reasons[], facts[] } for a BUY (s=1) or SELL (s=-1)
+function gateJudge(D, s, at) {
+  const n = D.n, i = at === undefined ? n - 2 : at, e = i + 1;           // i = last finished candle, e = the one forming now
+  const why = [], facts = [];
+  const atr = D.atr[i];
+  if (!(atr > 0)) return { ok: true, reasons: [], facts: ['not enough data'] };
+  const price = D.o[e];
 
-  if (cmd === '/start') {
-    if (botRunning) return sendTelegram('⚠️ Already running\\. Use /status');
-    startBot(true);
-    return Promise.resolve();
+  // 1. spread
+  const sp = D.sp[e], med = D.medSp;
+  if (med > 0) {
+    facts.push('spread ' + (sp / med).toFixed(1) + 'x normal');
+    if (sp > 2 * med) why.push('spread is ' + (sp / med).toFixed(1) + 'x normal');
   }
-  if (cmd === '/stop') {
-    stopBot();
-    return sendTelegram('⏸️ Stopped\\. ' + md(signalCount) + ' signals · ' + md(dailyWins) + 'W/' + md(dailyLosses) + 'L');
-  }
-  if (cmd === '/status') {
-    const s = getSession();
-    return sendTelegram(
-      '📊 *Status*\n\n' +
-      'Bot: ' + (botRunning ? '🟢 Running' : '🔴 Stopped') + '\n' +
-      'Auto\\-trading: ' + (autoTrade ? '🤖 ON' : '✋ OFF') + '\n' +
-      'Broker: ' + md(tradeBroker) + '\n' +
-      (circuitOpen ? '🛑 Paused: ' + md(circuitReason) + '\n' : '') +
-      'Open trades: ' + md(pendingTrades.length) + '\n' +
-      'Signals: ' + md(signalCount) + '\n' +
-      'Wins: ' + md(dailyWins) + ' · Losses: ' + md(dailyLosses) + '\n' +
-      s.emoji + ' ' + md(s.message) + '\n' +
-      'Time: ' + md(lusakaTime()) + ' CAT'
-    );
-  }
-  if (cmd === '/auto') {
-    if (arg === 'on') { autoTrade = true; return sendTelegram('🤖 Auto\\-trading *ON* \\(' + md(isDemoAccount() ? 'demo' : 'REAL account') + '\\)'); }
-    if (arg === 'off') { autoTrade = false; return sendTelegram('✋ Auto\\-trading *OFF*\\. Manual signals only\\.'); }
-    return sendTelegram('Use /auto on or /auto off');
-  }
-  if (cmd === '/deeptest') {
-    if (deepRunning) return sendTelegram('⏳ Deep test is already running\\.');
-    deepRunning = true;
-    return sendTelegram('⏳ Deep test started\\. It takes about 5 to 8 minutes\\. I will message you when done\\.').then(function () {
-      return runDeepTest();
-    }).then(function (txt) {
-      deepRunning = false;
-      return sendTelegram(txt);
-    }).catch(function (e) {
-      deepRunning = false;
-      return sendTelegram('❌ Deep test failed: ' + md(e.message));
-    });
-  }
-  if (cmd === '/backtest') {
-    if (backtesting) return sendTelegram('⏳ Backtest is already running\\.');
-    backtesting = true;
-    return sendTelegram('⏳ Backtest started\\. This takes about a minute\\.').then(function () {
-      return runBacktest();
-    }).then(function (txt) {
-      backtesting = false;
-      return sendTelegram(txt);
-    }).catch(function (e) {
-      backtesting = false;
-      return sendTelegram('❌ Backtest failed: ' + md(e.message));
-    });
-  }
-  if (cmd === '/resume') {
-    circuitOpen = false; circuitNotified = false; consecLosses = 0; dayPnl = 0;
-    return sendTelegram('▶️ Auto\\-trading resumed\\.');
-  }
-  if (cmd === '/limit') {
-    const n = parseInt(arg, 10);
-    if (!(n >= 1 && n <= 200)) return sendTelegram('🛑 Daily limit: ' + md(maxTradesPerDay) + ' trades \(' + md(tradesToday) + ' today\)\nUse /limit 40');
-    maxTradesPerDay = n;
-    limitNotifiedDay = '';
-    return sendTelegram('🛑 Daily limit set to *' + md(n) + ' trades*\.');
-  }
-  if (cmd === '/duration') {
-    const m = parseInt(arg, 10);
-    if ([1, 2, 3, 5, 10, 15, 30].indexOf(m) === -1) {
-      return sendTelegram('⏱ Trade length: ' + md(durationMin) + ' min\nUse /duration 1, 2, 3, 5, 10, 15 or 30');
+  // 2. volatility versus the last 100 hours
+  const arr = [];
+  for (let k = Math.max(20, i - 100); k <= i; k++) if (D.atr[k] > 0) arr.push(D.atr[k]);
+  arr.sort(function (a, b) { return a - b; });
+  const ma = arr.length ? arr[Math.floor(arr.length / 2)] : atr;
+  const vr = atr / ma;
+  facts.push('movement ' + vr.toFixed(2) + 'x normal');
+  if (vr < 0.6) why.push('market is dead (movement ' + vr.toFixed(2) + 'x normal)');
+  if (vr > 2.5) why.push('market is too wild (movement ' + vr.toFixed(2) + 'x normal)');
+  // 3. trend
+  const up200 = D.c[i] > D.ema200[i], up50 = D.ema50[i] > D.ema200[i], h4 = D.h4up[i];
+  const trend = (up200 && up50 && h4 >= 0) ? 1 : (!up200 && !up50 && h4 <= 0) ? -1 : 0;
+  facts.push('trend ' + (trend > 0 ? 'up' : trend < 0 ? 'down' : 'mixed') + ', ADX ' + (D.adx[i] || 0).toFixed(0));
+  if (trend === -s && (D.adx[i] || 0) >= 25) why.push('trading against a strong ' + (trend > 0 ? 'up' : 'down') + 'trend');
+  // 4. exhausted move
+  const rsi = D.rsi[i];
+  facts.push('RSI ' + (rsi || 0).toFixed(0));
+  if (s > 0 && rsi > 75) why.push('already stretched up (RSI ' + rsi.toFixed(0) + ')');
+  if (s < 0 && rsi < 25) why.push('already stretched down (RSI ' + rsi.toFixed(0) + ')');
+  // 5. room to run before the previous day's high / low
+  const wall = s > 0 ? D.pdH[i] : D.pdL[i];
+  if (wall > 0) {
+    const room = s > 0 ? wall - price : price - wall;
+    if (room > 0) {
+      facts.push('room to day level ' + (room / atr).toFixed(1) + ' ATR');
+      if (room < 0.5 * atr) why.push('price is right at yesterday\'s ' + (s > 0 ? 'high' : 'low'));
     }
-    durationMin = m;
-    return sendTelegram('⏱ Trade length set to *' + md(m) + ' min*\. Resets to ' + md(process.env.DURATION_MIN || 15) + ' min if Render restarts\.');
   }
-  if (cmd === '/newstrade') {
-    if (arg === 'on' || arg === 'off') newsTrade = arg === 'on';
-    return sendTelegram(md(ntReport()) + '\n\nUse /newstrade on or off\\.');
-  }
-  if (cmd === '/news') {
-    if (arg === 'on' || arg === 'off') {
-      newsOn = arg === 'on';
-      return (newsOn ? loadNews() : Promise.resolve()).then(function () {
-        return sendTelegram('📰 News filter *' + md(arg.toUpperCase()) + '*');
+  // 6. what the last finished candle says
+  const body = D.c[i] - D.o[i];
+  facts.push('last candle ' + (body > 0 ? 'up' : 'down') + ' ' + (Math.abs(body) / atr).toFixed(1) + ' ATR');
+  if (-s * body >= 1.2 * atr) why.push('last candle is a strong ' + (body > 0 ? 'up' : 'down') + ' move against the trade');
+  let patAgainst = null;
+  PAT_CANDLE.forEach(function (p) {
+    try { if ((D._pc ? D._pc[p[0]] : patCandle(D, p[0]))[i] === -s) patAgainst = p[1]; } catch (err) { /* skip */ }
+  });
+  if (patAgainst) why.push('last candle shows ' + patAgainst + ' against the trade');
+  return { ok: why.length === 0, reasons: why, facts: facts };
+}
+
+// used before a Capital trade is placed. If the candles cannot be read, the trade is allowed.
+function gateCheck(symbol, action, display) {
+  if (!gateOn) return Promise.resolve({ ok: true, reasons: [] });
+  const s = action === 'BUY' ? 1 : -1;
+  return gateRead(symbol).then(function (D) {
+    const r = gateJudge(D, s);
+    if (r.ok) { gateStats.pass++; return r; }
+    gateStats.block++;
+    r.reasons.forEach(function (w) { const k = w.replace(/[0-9.]+/g, '#'); gateStats.why[k] = (gateStats.why[k] || 0) + 1; });
+    const key = symbol + ':' + Math.floor(Date.now() / 3600000);
+    console.log('Gate skip ' + symbol + ' ' + action + ': ' + r.reasons.join('; '));
+    if (!gateNotified[key]) {
+      gateNotified[key] = true;
+      sendTelegram('🔍 *Skipped ' + md(display || symbol) + ' ' + md(action) + '*\n' + md(r.reasons.join('; ') + '.'));
+    }
+    return r;
+  }).catch(function (err) { console.log('Gate could not read ' + symbol + ': ' + err.message); return { ok: true, reasons: [] }; });
+}
+
+function gateReport() {
+  const L = ['🔍 Pre-trade market read: ' + (gateOn ? 'ON' : 'OFF'),
+    'Before each Capital.com trade the bot reads the last hourly candles: spread, movement size, trend, stretched RSI, room to the day high/low, and the last candle.',
+    'Passed: ' + gateStats.pass + ' · Skipped: ' + gateStats.block + ' (since restart)'];
+  Object.keys(gateStats.why).sort(function (a, b) { return gateStats.why[b] - gateStats.why[a]; }).slice(0, 6).forEach(function (k) {
+    L.push('  ' + gateStats.why[k] + 'x ' + k);
+  });
+  L.push('Not proven to improve results. Deriv synthetic indices are random, so candles are not read there.');
+  L.push('/analyze EURUSD shows the full read of one market.');
+  return L.join('\n');
+}
+
+function analyzeMarket(sym) {
+  const known = {};
+  PAIRS.forEach(function (p) { if (p.type !== 'derived') known[p.symbol] = p; });
+  if (!known[sym]) return Promise.resolve('Unknown market. Try: ' + Object.keys(known).slice(0, 12).join(', '));
+  return gateRead(sym).then(function (D) {
+    const b = gateJudge(D, 1), sl = gateJudge(D, -1);
+    const f = function (r) { return r.ok ? 'OK' : 'skip: ' + r.reasons.join('; '); };
+    return ['🔍 ' + sym + ' (hourly candles, last finished ' + new Date(D.bars[D.n - 2].t).toISOString().slice(0, 16).replace('T', ' ') + ' UTC)',
+      b.facts.join(' · '), '', 'A BUY now: ' + f(b), 'A SELL now: ' + f(sl)].join('\n');
+  }).catch(function (e) { return 'Could not read ' + sym + ': ' + e.message; });
+}
+
+// ===== Percent risk, drawdown pause, rolling walk-forward test, market-read A/B test =====
+let capRiskPct = Number(process.env.CAP_RISK_PCT || 0);      // 0 = use the fixed dollar risk
+let ddPct = Number(process.env.DD_PCT || 0);                 // 0 = only the dollar daily limit
+let capBalCache = { v: 0, t: 0 };
+let xtRunning = false;
+
+function capBalFresh() {
+  if (!CAP_ON) return Promise.resolve(capBalCache.v);
+  if (capBalCache.v > 0 && Date.now() - capBalCache.t < 10 * 60000) return Promise.resolve(capBalCache.v);
+  return capBalance().then(function (a) {
+    const v = Number(a.balance && a.balance.balance) || 0;
+    if (v > 0) capBalCache = { v: v, t: Date.now() };
+    return capBalCache.v;
+  }).catch(function () { return capBalCache.v; });
+}
+function capRiskNow() {
+  if (!(capRiskPct > 0)) return Promise.resolve(capRisk);
+  return capBalFresh().then(function (v) { return v > 0 ? Math.max(0.5, v * capRiskPct / 100) : capRisk; });
+}
+function ddLimitNow() {
+  let lim = MAX_DAILY_LOSS;
+  if (ddPct > 0 && capBalCache.v > 0) lim = Math.min(lim, capBalCache.v * ddPct / 100);
+  if (ddPct > 0) capBalFresh();
+  return lim;
+}
+
+// run fn(sym, D) on each market's hourly history
+function xtEach(fn) {
+  const errors = [];
+  let used = 0, minT = Infinity, maxT = 0;
+  return ST_MARKETS.reduce(function (chain, sym) {
+    return chain.then(function () {
+      return stFetchHistory(sym, STRAT_PAGES, errors).then(function (bars) {
+        if (bars.length < 1000) { errors.push(sym + ': only ' + bars.length + ' bars'); return null; }
+        used++;
+        minT = Math.min(minT, bars[0].t); maxT = Math.max(maxT, bars[bars.length - 1].t);
+        fn(sym, stBuild(bars));
+        return new Promise(function (r) { setImmediate(r); });
       });
-    }
-    return ensureNews().then(function () { return sendTelegram(md(newsReport())); });
-  }
-  if (cmd === '/patterntest') {
-    if (patRunning || smcRunning || evoRunning || stratRunning || volRunning) return sendTelegram('⏳ A test is already running\\.');
-    patRunning = true;
-    return sendTelegram('⏳ Pattern test started: candlestick and chart patterns\\. About 3 to 6 minutes\\.').then(function () {
-      return runPatternTest();
-    }).then(function (res) {
-      patRunning = false;
-      return res.msgs.reduce(function (chain, m) { return chain.then(function () { return sendLong(m); }); }, Promise.resolve());
-    }).catch(function (e) {
-      patRunning = false;
-      return sendTelegram('❌ Pattern test failed: ' + md(e.message));
     });
-  }
-  if (cmd === '/forward') {
-    if (arg === 'on' || arg === 'off') fwOn = arg === 'on';
-    return sendLong(fwReport());
-  }
-  if (cmd === '/mirror') {
-    if (arg === 'on' || arg === 'off') mirrorOn = arg === 'on';
-    return sendTelegram('🪞 Mirror to Deriv: *' + md(mirrorOn ? 'ON' : 'OFF') + '*\\. Copies each Capital\\.com forex and metals trade on Deriv as a Rise/Fall contract\\. Use /mirror on or /mirror off\\.');
-  }
-  if (cmd === '/panic') {
-    return panicStop();
-  }
-  if (cmd === '/smc') {
-    if (arg === 'on' || arg === 'off') smcOn = arg === 'on';
-    return sendTelegram(md(smcReport()));
-  }
-  if (cmd === '/smctest') {
-    if (smcRunning || evoRunning || stratRunning || volRunning) return sendTelegram('⏳ A test is already running\\.');
-    smcRunning = true;
-    return sendTelegram('⏳ Market\\-structure test started \\(BOS, FVG, pullback entries\\)\\. About 3 to 6 minutes\\.').then(function () {
-      return runSmcTest();
-    }).then(function (res) {
-      smcRunning = false;
-      return res.msgs.reduce(function (chain, m) { return chain.then(function () { return sendLong(m); }); }, Promise.resolve());
-    }).catch(function (e) {
-      smcRunning = false;
-      return sendTelegram('❌ Market\\-structure test failed: ' + md(e.message));
-    });
-  }
-  if (cmd === '/poctest') {
-    if (pocRunning || smcRunning || evoRunning || stratRunning || volRunning) return sendTelegram('⏳ A test is already running\\.');
-    pocRunning = true;
-    return sendTelegram('⏳ Volume\\-profile PoC test started\\. About 3 to 6 minutes\\.').then(function () {
-      return runPocTest();
-    }).then(function (res) {
-      pocRunning = false;
-      return res.msgs.reduce(function (chain, m) { return chain.then(function () { return sendLong(m); }); }, Promise.resolve());
-    }).catch(function (e) {
-      pocRunning = false;
-      return sendTelegram('❌ PoC test failed: ' + md(e.message));
-    });
-  }
-  if (cmd === '/evolved') {
-    if (arg === 'on' || arg === 'off') evoOn = arg === 'on';
-    return sendTelegram(md(evoReport()));
-  }
-  if (cmd === '/strategysearch') {
-    if (evoRunning || stratRunning || volRunning) return sendTelegram('⏳ A test is already running\\.');
-    evoRunning = true;
-    return sendTelegram('⏳ Strategy search started: the bot is building and testing its own rules\\. About 5 to 10 minutes\\.').then(function () {
-      return runStrategySearch();
-    }).then(function (res) {
-      evoRunning = false;
-      return res.msgs.reduce(function (chain, m) { return chain.then(function () { return sendLong(m); }); }, Promise.resolve());
-    }).catch(function (e) {
-      evoRunning = false;
-      return sendTelegram('❌ Strategy search failed: ' + md(e.message));
-    });
-  }
-  if (cmd === '/volatile') {
-    if (arg === 'on' || arg === 'off') volatileMode = arg === 'on';
-    return sendTelegram(md(volReport()));
-  }
-  if (cmd === '/volatiletest') {
-    if (volRunning || stratRunning) return sendTelegram('⏳ A test is already running\\.');
-    volRunning = true;
-    return sendTelegram('⏳ Volatile\\-market test started\\. About 3 to 6 minutes\\.').then(function () {
-      return runVolatileTest();
-    }).then(function (res) {
-      volRunning = false;
-      return res.msgs.reduce(function (chain, m) { return chain.then(function () { return sendLong(m); }); }, Promise.resolve());
-    }).catch(function (e) {
-      volRunning = false;
-      return sendTelegram('❌ Volatile test failed: ' + md(e.message));
-    });
-  }
-  if (cmd === '/strategytest') {
-    if (stratRunning) return sendTelegram('⏳ Strategy test is already running\\.');
-    stratRunning = true;
-    return sendTelegram('⏳ Strategy test started: 16 modules on hourly Capital\\.com candles\\. It takes about 3 to 6 minutes\\. I will message you when it is done\\.').then(function () {
-      return runStrategyTest();
-    }).then(function (res) {
-      stratRunning = false;
-      return res.msgs.reduce(function (chain, m) { return chain.then(function () { return sendLong(m); }); }, Promise.resolve()).then(function () { return stSendCsv(res.rows); });
-    }).catch(function (e) {
-      stratRunning = false;
-      return sendTelegram('❌ Strategy test failed: ' + md(e.message));
-    });
-  }
-  if (cmd === '/capital') {
-    return capitalDiag().then(function (t) { return sendTelegram(md(t)); })
-      .catch(function (e) { return sendTelegram('❌ ' + md(e.message)); });
-  }
-  if (cmd === '/broker') {
-    if (arg === 'capital' || arg === 'deriv' || arg === 'both') {
-      if (arg !== 'deriv' && !CAP_ON) return sendTelegram('❌ Capital\\.com keys are missing in Render\\.');
-      tradeBroker = arg;
-      return sendTelegram('🔀 Trading broker: *' + md(arg) + '*' + (arg === 'capital' ? md(' (Capital demo: forex, metals, indices, oil, crypto)') : arg === 'both' ? md(' (Capital demo for forex, metals, indices, oil, crypto + Deriv for volatility indices)') : md(' (Deriv, all its markets)')) + '\\. Resets if Render restarts unless TRADE_BROKER is set\\.');
-    }
-    return sendTelegram('Broker now: ' + md(tradeBroker) + '\nUse /broker capital, /broker deriv or /broker both');
-  }
-  if (cmd === '/risk') {
-    const v = Number(arg);
-    if (!(v >= 0.5 && v <= 50)) return sendTelegram('💵 Capital risk per trade: $' + md(capRisk) + '\nUse /risk 3 \\(between 0\\.5 and 50\\)');
-    capRisk = v;
-    return sendTelegram('💵 Risk per trade set to *$' + md(v) + '*');
-  }
-  if (cmd === '/learn') {
-    return learn().then(function () {
-      return sendTelegram('🧠 *Learning*\n\n' + md(lastLearnInfo) + '\n\nStorage: ' + md(DB_ON ? 'Supabase' : 'memory only'));
-    });
-  }
-  if (cmd === '/win') { dailyWins++; return sendTelegram('✅ Win recorded: ' + md(dailyWins) + 'W/' + md(dailyLosses) + 'L'); }
-  if (cmd === '/loss') { dailyLosses++; return sendTelegram('❌ Loss recorded: ' + md(dailyWins) + 'W/' + md(dailyLosses) + 'L'); }
-  if (cmd === '/balance') {
-    return derivBalance()
-      .then(function (b) { return sendTelegram('💰 Balance: ' + md(b)); })
-      .catch(function (e) { return sendTelegram('❌ ' + md(e.message)); });
-  }
-  if (cmd === '/accounts') {
-    return listAccounts()
-      .then(function (j) { return sendTelegram('🧾 ' + md(JSON.stringify(j).slice(0, 900))); })
-      .catch(function (e) { return sendTelegram('❌ ' + md(e.message.slice(0, 600))); });
-  }
-  return Promise.resolve();
+  }, Promise.resolve()).then(function () { return { used: used, errors: errors, minT: minT, maxT: maxT }; });
 }
-
-// ---------- HTTP ----------
-
-function send(res, code, obj) {
-  res.writeHead(code, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify(obj));
+function xtTrades(D, sym, keys) {
+  const out = [];
+  keys.forEach(function (k) {
+    const si = ST_STRATS.findIndex(function (s) { return s[0] === k; });
+    const sig = stSignals(k, D, 1000 + si * 77 + sym.length);
+    stSim(D, sig, ST_VARIANTS[0], [D.n, D.n], [stNewAcc(), stNewAcc(), stNewAcc()], { overlap: 0, wideSpread: 0, noAtr: 0 }, out, null, sym, k);
+  });
+  out.forEach(function (r) { r.k = r.s; });
+  return out;
 }
+function xtLine(a) { return a.n ? a.n + ' trades, ' + stF(stExp(a)) + 'R each, PF ' + stPF(a).toFixed(2) + ', win ' + Math.round(100 * a.w / a.n) + '%' : 'no trades'; }
 
-const server = http.createServer(function (req, res) {
-  // Keep-alive ping (no secret needed). Point a free pinger here every 10 minutes.
-  if (req.method === 'GET') {
-    send(res, 200, { ok: true, running: botRunning, time: new Date().toISOString() });
-    return;
-  }
-
-  let body = '';
-  req.on('data', function (c) { body += c; });
-  req.on('end', function () {
-    let p;
-    try { p = JSON.parse(body); }
-    catch (e) { send(res, 400, { ok: false, error: 'Invalid JSON' }); return; }
-
-    // Telegram webhook: only your own chat is allowed
-    if (req.url && req.url.indexOf('/telegram') === 0) {
-      const m = p.message;
-      send(res, 200, { ok: true });
-      if (m && m.text && m.chat && String(m.chat.id) === String(TELEGRAM_CHAT_ID)) {
-        handleTelegramCommand(m.text).catch(function (e) { console.error('Command error: ' + e.message); });
-      }
-      return;
-    }
-
-    // Everything else needs the bridge secret
-    if (req.headers['x-bridge-secret'] !== BRIDGE_SECRET) {
-      send(res, 401, { ok: false, error: 'Unauthorized' });
-      return;
-    }
-
-    console.log('[' + new Date().toISOString() + '] ' + p.cmd + ' ' + (p.symbol || ''));
-
-    if (p.cmd === 'ANALYZE') {
-      const derivSym = SYMBOL_MAP[p.symbol];
-      if (!derivSym) { send(res, 400, { ok: false, error: 'Unknown symbol' }); return; }
-      fetchCandles(derivSym, 80).then(function (prices) {
-        send(res, 200, { ok: true, symbol: p.symbol, analysis: analyze(prices) });
-      }).catch(function (err) {
-        send(res, 200, { ok: false, symbol: p.symbol, error: err.message });
+// Rolling walk-forward: pick the best strategy on 150 days, trade it for the next 30 days, roll forward.
+function runWalkForward() {
+  if (!CAP_ON) return Promise.reject(new Error('Capital.com keys are missing.'));
+  const keys = ST_STRATS.map(function (s) { return s[0]; });
+  const names = {}; ST_STRATS.forEach(function (s) { names[s[0]] = s[1]; });
+  const DAY = 86400000, TR = 150 * DAY, TE = 30 * DAY;
+  let all = [];
+  return xtEach(function (sym, D) { all = all.concat(xtTrades(D, sym, keys)); }).then(function (meta) {
+    if (!meta.used || !all.length) throw new Error('No usable history. ' + (meta.errors[0] || ''));
+    const t0 = all.reduce(function (m, r) { return Math.min(m, r.t); }, Infinity);
+    const sel = stNewAcc(), base = stNewAcc(), rnd = stNewAcc();
+    const lines = [], selR = [];
+    let wins = 0, traded = 0, nW = 0;
+    for (let ws = t0; ws + TR + TE <= meta.maxT; ws += TE) {
+      nW++;
+      const a = ws + TR, b = a + TE;
+      const tr = {}, te = {};
+      keys.forEach(function (k) { tr[k] = stNewAcc(); te[k] = stNewAcc(); });
+      all.forEach(function (r) {
+        if (r.t >= ws && r.x < a) stAdd(tr[r.k], r.r);
+        else if (r.t >= a && r.t < b) stAdd(te[r.k], r.r);
       });
-      return;
+      let best = null;
+      keys.forEach(function (k) {
+        if (k === 'rand' || tr[k].n < 20) return;
+        if (stExp(tr[k]) > 0 && (!best || stExp(tr[k]) > stExp(tr[best]))) best = k;
+      });
+      keys.forEach(function (k) {
+        const x = te[k];
+        if (k === 'rand') { rnd.n += x.n; rnd.w += x.w; rnd.sumR += x.sumR; rnd.gp += x.gp; rnd.gl += x.gl; }
+        else { base.n += x.n; base.w += x.w; base.sumR += x.sumR; base.gp += x.gp; base.gl += x.gl; }
+      });
+      const d0 = new Date(a).toISOString().slice(0, 10);
+      if (!best) { lines.push('Test month from ' + d0 + ': no strategy was positive in training, stayed out'); continue; }
+      const x = te[best];
+      sel.n += x.n; sel.w += x.w; sel.sumR += x.sumR; sel.gp += x.gp; sel.gl += x.gl;
+      if (x.n) { traded++; if (x.sumR > 0) wins++; }
+      lines.push('Test month from ' + d0 + ': picked ' + names[best] + ' (train ' + stF(stExp(tr[best])) + 'R), then ' + (x.n ? x.n + ' trades at ' + stF(stExp(x)) + 'R' : 'no trades'));
     }
+    if (nW < 3) throw new Error('Only ' + nW + ' windows fit in the history, not enough for a walk-forward.');
+    let verdict;
+    if (sel.n < 30) verdict = 'too few trades';
+    else if (stExp(sel) >= 0.05 && stPF(sel) >= 1.15 && wins >= Math.ceil(traded * 0.6) && stExp(sel) - stExp(base) >= 0.05 && stExp(sel) > stExp(rnd)) verdict = 'PASS ✅';
+    else verdict = 'fail';
+    const m1 = ['📊 *' + md('Rolling walk-forward test') + '*',
+      md(meta.used + ' markets, ' + nW + ' rolling windows. Each window: pick the best of 14 strategies on 150 days of data, then trade only that one on the next 30 days it has never seen. Real spread + slippage. Strategies and costs are the same as /strategytest.')].join('\n');
+    const m2 = [md('Out-of-sample months only:'),
+      md('  Picked strategy: ' + xtLine(sel) + ', positive in ' + wins + ' of ' + traded + ' traded months'),
+      md('  Average of all strategies: ' + xtLine(base)),
+      md('  Random control: ' + xtLine(rnd)),
+      md('  -> ' + verdict), ''].concat(lines.map(md)).join('\n');
+    const m3 = '*' + md(verdict.indexOf('PASS') === 0 ? 'Passed on this history. Treat it as a lead only; the forward tracker is the real test.' : 'Verdict: picking the best recent strategy does not beat chance after costs here. Do not trade it.') + '*';
+    return { msgs: [m1, m2, m3] };
+  });
+}
 
-    if (p.cmd === 'ACCOUNTS') {
-      listAccounts().then(function (j) { send(res, 200, { ok: true, accounts: j }); })
-        .catch(function (err) { send(res, 200, { ok: false, error: err.message }); });
-      return;
-    }
-
-    if (p.cmd === 'BALANCE') {
-      derivBalance().then(function (b) { send(res, 200, { ok: true, balance: b }); })
-        .catch(function (err) { send(res, 200, { ok: false, error: err.message }); });
-      return;
-    }
-
-    if (p.cmd === 'BUY') {
-      placeTrade(p.symbol, p.action, p.stake).then(function (t) { send(res, 200, { ok: true, trade: t }); })
-        .catch(function (err) { send(res, 200, { ok: false, error: err.message }); });
-      return;
-    }
-
-    if (p.cmd === 'CHECK') {
-      checkContract(p.contract_id).then(function (r) { send(res, 200, { ok: true, result: r }); })
-        .catch(function (err) { send(res, 200, { ok: false, error: err.message }); });
-      return;
-    }
-
-    // Dashboard controls
-    if (p.cmd === 'BOT_STATUS') { send(res, 200, Object.assign({ ok: true }, botStatus())); return; }
-    if (p.cmd === 'BOT_START') {
-      const started = startBot(true);
-      send(res, 200, { ok: true, success: started, message: started ? 'Started' : 'Already running' });
-      return;
-    }
-    if (p.cmd === 'BOT_STOP') {
-      const stopped = stopBot();
-      if (stopped) sendTelegram('⏸️ Stopped\\. ' + md(signalCount) + ' signals · ' + md(dailyWins) + 'W/' + md(dailyLosses) + 'L');
-      send(res, 200, { ok: true, success: stopped, signalCount: signalCount, dailyWins: dailyWins, dailyLosses: dailyLosses });
-      return;
-    }
-    if (p.cmd === 'BOT_TEST') {
-      const pair = availablePairs()[0] || PAIRS[0];
-      analyseSymbol(pair.symbol).then(function (a) {
-        if (!a) { send(res, 200, { ok: false, error: 'Deriv feed unreachable' }); return null; }
-        return sendTelegram(
-          '🔔 *Test — ' + md(pair.display) + '*\n\n' +
-          'Action: *' + md(a.action) + '*\n' +
-          'Price: ' + md(a.price.toFixed(pair.decimals)) + '\n' +
-          'RSI: ' + md(a.rsi.toFixed(1)) + '\n' +
-          'Reason: ' + md(a.reason) + '\n\n' +
-          '✅ Live Deriv feed working\\!'
-        ).then(function (ok) {
-          send(res, 200, { ok: true, success: ok, signal: { symbol: pair.display, action: a.action, rsi: a.rsi } });
+// Does the market read (/gate) help? Same trades, split into ones it would allow and ones it would skip.
+function runGateTest() {
+  if (!CAP_ON) return Promise.reject(new Error('Capital.com keys are missing.'));
+  const keys = ST_STRATS.map(function (s) { return s[0]; }).filter(function (k) { return k !== 'rand'; });
+  const tot = stNewAcc(), pass = stNewAcc(), blk = stNewAcc();
+  const half = [{ p: stNewAcc(), b: stNewAcc() }, { p: stNewAcc(), b: stNewAcc() }];
+  const rp = [], rb = [], why = {};
+  return xtEach(function (sym, D) {
+    D._pc = {};
+    PAT_CANDLE.forEach(function (p) { D._pc[p[0]] = patCandle(D, p[0]); });
+    const idx = new Map();
+    D.bars.forEach(function (b, i) { idx.set(b.t, i); });
+    xtTrades(D, sym, keys).forEach(function (r) {
+      const e = idx.get(r.t);
+      if (e === undefined || e < 1) return;
+      const g = gateJudge(D, r.d, e - 1);
+      const h = e < D.n * 0.5 ? 0 : 1;
+      stAdd(tot, r.r);
+      if (g.ok) { stAdd(pass, r.r); stAdd(half[h].p, r.r); rp.push(r.r); }
+      else {
+        stAdd(blk, r.r); stAdd(half[h].b, r.r); rb.push(r.r);
+        g.reasons.forEach(function (w) {
+          const k = w.replace(/[0-9.]+x?/g, '#').replace(/\(.*?\)/g, '').trim();
+          (why[k] || (why[k] = stNewAcc()));
+          stAdd(why[k], r.r);
         });
-      });
-      return;
-    }
-
-    send(res, 400, { ok: false, error: 'Unknown command: ' + p.cmd });
+      }
+    });
+  }).then(function (meta) {
+    if (!meta.used || tot.n < 100) throw new Error('Not enough trades to test (' + tot.n + '). ' + (meta.errors[0] || ''));
+    const mv = function (a) { const m = a.reduce(function (s, x) { return s + x; }, 0) / (a.length || 1); const v = a.reduce(function (s, x) { return s + (x - m) * (x - m); }, 0) / Math.max(1, a.length - 1); return { m: m, v: v, n: a.length }; };
+    const P = mv(rp), B = mv(rb);
+    const t = (P.n > 1 && B.n > 1) ? (P.m - B.m) / Math.sqrt(P.v / P.n + B.v / B.n) : 0;
+    const consistent = [0, 1].every(function (h) { return half[h].p.n && half[h].b.n && stExp(half[h].p) > stExp(half[h].b); });
+    let verdict;
+    if (pass.n < 100 || blk.n < 50) verdict = 'too few trades';
+    else if (stExp(pass) - stExp(tot) >= 0.03 && t >= 2 && consistent) verdict = 'HELPS ✅';
+    else if (stExp(pass) <= stExp(blk)) verdict = 'does not help';
+    else verdict = 'unclear';
+    const m1 = ['📊 *' + md('Market-read (/gate) test') + '*',
+      md(meta.used + ' markets, 14 strategies, the same trades as /strategytest (stop 1.5 ATR, target 3 ATR, real spread + slippage). Each trade is judged by the market read at its entry candle: allowed or skipped. Approximation: skipping a trade can change which later trades happen.')].join('\n');
+    const lines = Object.keys(why).sort(function (a, b) { return why[b].n - why[a].n; }).slice(0, 6).map(function (k) { return '  ' + k + ': ' + why[k].n + ' trades, ' + stF(stExp(why[k])) + 'R each'; });
+    const m2 = [md('All trades:     ' + xtLine(tot)),
+      md('Gate allows:    ' + xtLine(pass)),
+      md('Gate skips:     ' + xtLine(blk)),
+      md('Difference allowed minus skipped: ' + stF(P.m - B.m) + 'R per trade, t ' + t.toFixed(1)),
+      md('First half: allowed ' + stF(stExp(half[0].p)) + 'R vs skipped ' + stF(stExp(half[0].b)) + 'R | second half: allowed ' + stF(stExp(half[1].p)) + 'R vs skipped ' + stF(stExp(half[1].b)) + 'R'),
+      md('-> ' + verdict), '', md('Reasons for skipping (trades it removed):')].concat(lines.map(md)).join('\n');
+    const m3 = '*' + md(verdict.indexOf('HELPS') === 0 ? 'The market read removed worse-than-average trades in both halves. Keep /gate on, but remember the strategies themselves are still not proven.' : (verdict === 'does not help' ? 'The skipped trades were no worse than the allowed ones, so /gate adds nothing here. Consider /gate off.' : 'No clear effect. Do not rely on /gate to make the bot profitable.')) + '*';
+    return { msgs: [m1, m2, m3] };
   });
-});
+}
 
-server.listen(PORT, function () {
-  console.log('ForexPulse Bridge on port ' + PORT);
-  console.log('App ID set: ' + (DERIV_APP_ID ? 'yes' : 'NO') + ' | Token set: ' + (DERIV_API_TOKEN ? 'yes' : 'NO') +
-    ' | Telegram set: ' + (TELEGRAM_TOKEN && TELEGRAM_CHAT_ID ? 'yes' : 'NO') +
-    ' | Auto-trade: ' + autoTrade + ' | Demo account: ' + isDemoAccount());
-  // Restart-proof: Render restarts the server now and then, so resume by itself
-  console.log('Trade log: ' + (DB_ON ? 'Supabase' : 'memory only (set SUPABASE_URL and SUPABASE_KEY)'));
-  stateLoad().then(learn).then(capReconcile).then(fwLoad).then(function () {
-    if (process.env.BOT_AUTOSTART === 'true') startBot(true);
-  });
-});
